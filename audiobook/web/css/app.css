@@ -32,6 +32,8 @@
 }
 
 * { box-sizing: border-box; }
+/* Ползунки, галочки и переключатели — в цвет приложения, а не браузерные синие. */
+:root { accent-color: var(--accent); }
 /* display у .player и других блоков иначе перебивает атрибут hidden. */
 [hidden] { display: none !important; }
 html, body { height: 100%; }
@@ -201,10 +203,17 @@ dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top
 }
 .toast {
   pointer-events: auto; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
-  border-radius: 8px; padding: 9px 14px; box-shadow: 0 6px 20px rgba(0, 0, 0, .15); max-width: 420px;
+  border-radius: 8px; padding: 8px 8px 8px 12px; box-shadow: 0 6px 20px rgba(0, 0, 0, .15); max-width: 440px;
+  display: flex; align-items: flex-start; gap: 10px; animation: toast-in .18s ease-out;
 }
+.toast .toast-icon { color: var(--accent); margin-top: 2px; }
 .toast.error { border-left-color: var(--warn); }
+.toast.error .toast-icon { color: var(--warn); }
 .toast.ok { border-left-color: var(--ok); }
+.toast.ok .toast-icon { color: var(--ok); }
+.toast-close { padding: 2px 4px; margin-top: -1px; color: var(--muted); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .toast { animation: none; } }
 
 .drop-overlay {
   position: fixed; inset: 0; display: grid; place-items: center; z-index: 40;
@@ -219,3 +228,15 @@ dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top
   background: var(--panel); border-top: 1px solid var(--line);
   display: flex; align-items: center; gap: 12px; padding: 0 16px;
 }
+
+/* ---------- обновление ---------- */
+
+.update-banner {
+  margin: 8px 10px; padding: 10px 12px; border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.update-title { display: flex; align-items: center; gap: 6px; font-weight: 600; color: var(--accent); }
+.update-banner button { align-self: flex-start; }
+code.path { font-size: 12px; background: var(--sunken); padding: 3px 8px; border-radius: 6px; overflow-wrap: anywhere; }

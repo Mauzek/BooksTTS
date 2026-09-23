@@ -52,6 +52,21 @@ export const patch = (path, body = {}) => api(path, { method: 'PATCH', body });
 export const put = (path, body = {}) => api(path, { method: 'PUT', body });
 export const del = (path) => api(path, { method: 'DELETE' });
 
+const FINISHED = new Set(['done', 'failed', 'cancelled']);
+
+/**
+ * Дождаться задачи из очереди, сообщая о прогрессе.
+ * Возвращает итоговое состояние задачи; ошибкой не считает — решает вызывающий.
+ */
+export async function waitForJob(jobId, onUpdate = () => {}, { interval = 1000, alive = () => true } = {}) {
+  for (;;) {
+    const job = await get(`/api/jobs/${jobId}`);
+    onUpdate(job);
+    if (FINISHED.has(job.status) || !alive()) return job;
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+}
+
 /**
  * Выбрать файлы книг. В десктопе — системный диалог (возвращает пути),
  * в браузере — обычный <input type=file> (возвращает File).

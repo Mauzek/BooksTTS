@@ -114,6 +114,51 @@ def exports_dir() -> Path:
     return library_root() / "exports"
 
 
+# --------------------------------------------------------------------------
+# Библиотека, созданная Python из Microsoft Store
+# --------------------------------------------------------------------------
+
+
+def legacy_library_roots() -> list[Path]:
+    """Библиотеки в песочнице Store-Python.
+
+    Python из Microsoft Store подменяет ``%APPDATA%`` папкой внутри своего
+    пакета. Собранное приложение этой подмены не видит и смотрит в настоящий
+    ``%APPDATA%`` — библиотека, заведённая раньше, осталась бы невидимой.
+    """
+    if sys.platform != "win32":
+        return []
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return []
+    packages = Path(local) / "Packages"
+    pattern = f"PythonSoftwareFoundation.Python.*/LocalCache/Roaming/{APP_DIR_NAME}"
+    return sorted(p for p in packages.glob(pattern) if (p / "library.db").is_file())
+
+
+def adopt_legacy_library() -> Path | None:
+    """При первом запуске забрать старую библиотеку. Возвращает, откуда взята.
+
+    Копируем, а не переносим: старая остаётся на месте, пока пользователь сам
+    не решит её удалить. Ничего не делаем, если корень задан явно или в новом
+    месте библиотека уже есть — чужие данные не перетираются никогда.
+    """
+    import shutil
+
+    if _root is not None or os.environ.get(ENV_VAR):
+        return None
+    target = library_root()
+    if (target / "library.db").exists():
+        return None
+    candidates = [p for p in legacy_library_roots() if p.resolve() != target]
+    if not candidates:
+        return None
+    source = max(candidates, key=lambda p: (p / "library.db").stat().st_mtime)
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target, dirs_exist_ok=True)
+    return source
+
+
 def ensure_layout() -> Path:
     root = library_root()
     for directory in (root, books_dir(), audio_dir(), cache_dir(), previews_dir(), exports_dir()):

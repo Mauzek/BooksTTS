@@ -38,11 +38,20 @@ export function marked(text) {
 
 export const plain = (text) => String(text || '').replace(/[\x02\x03]/g, '');
 
+const TOAST_ICONS = { ok: 'circle-check', error: 'circle-alert', '': 'refresh-cw' };
+
 export function toast(message, kind = '') {
   const host = document.getElementById('toasts');
-  const node = el('div', { class: `toast ${kind}`, role: 'status' }, message);
+  const close = el('button', { class: 'ghost icon-button toast-close', title: 'Закрыть' }, icon('x', { size: 14 }));
+  const node = el('div', { class: `toast ${kind}`, role: kind === 'error' ? 'alert' : 'status' },
+    icon(TOAST_ICONS[kind] ?? TOAST_ICONS[''], { className: 'toast-icon' }),
+    el('span', { class: 'grow' }, message),
+    close);
+  close.onclick = () => node.remove();
   host.append(node);
-  setTimeout(() => node.remove(), kind === 'error' ? 7000 : 3500);
+  // Больше трёх одновременно — старые уходят: стопка уведомлений закрывает экран.
+  while (host.children.length > 3) host.firstElementChild.remove();
+  setTimeout(() => node.remove(), kind === 'error' ? 8000 : 3500);
 }
 
 function modal(build) {

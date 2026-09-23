@@ -1,6 +1,6 @@
 // Редактор разметки: текст главы слева, сегменты справа.
 
-import { get, post } from '../api.js';
+import { get, post, waitForJob } from '../api.js';
 import { ask, el, emit, guard, icon } from '../ui.js';
 
 const NARRATOR = 'narrator';
@@ -276,16 +276,30 @@ export function render(view, chapterId) {
     return edit('split', { segment_id: caret.segmentId, offset: caret.offset });
   }
 
+  // Разметка идёт через очередь: окно не висит, её видно в «Задачах» и можно
+  // отменить, а закрытие приложения посреди разметки её не теряет.
   markupButton.onclick = async () => {
     markupButton.disabled = true;
-    say('размечаю, это может занять с полминуты…');
+    say('ставлю в очередь…');
     try {
-      const data = await post(`/api/chapters/${chapterId}/markup`, {});
-      apply(data);
-      loadChecks();
-      emit('library-changed');
-      const issues = (data.markup?.issues || []).length;
-      say(issues ? `размечено, замечаний: ${issues}` : 'размечено', issues ? 'error' : 'ok');
+      const job = await post(`/api/chapters/${chapterId}/markup-job`, {});
+      emit('jobs-changed');
+      const final = await waitForJob(job.id, (current) => {
+        if (current.status === 'pending') say('ждёт своей очереди…');
+        if (current.status === 'running') {
+          say(`размечаю… ${Math.round((current.progress || 0) * 100)}%`);
+        }
+      }, { alive: () => state.alive });
+      if (!state.alive) return;
+      if (final.status === 'done') {
+        await load();
+        emit('library-changed');
+        say('размечено', 'ok');
+      } else if (final.status === 'cancelled') {
+        say('разметка отменена', 'error');
+      } else {
+        say(final.error || 'разметка не удалась', 'error');
+      }
     } catch (error) {
       say(error.message, 'error');
     } finally {

@@ -12,7 +12,7 @@ from audiobook.core.assemble import (
     assemble_chapter,
     ensure_ffmpeg,
 )
-from audiobook.core.tts import wav_bytes
+from audiobook.core.engines.silero import wav_bytes
 
 pytest.importorskip("pydub")
 

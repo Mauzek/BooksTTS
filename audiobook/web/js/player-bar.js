@@ -5,6 +5,11 @@ import * as player from './player.js';
 import { el, formatDuration, guard, icon, toast } from './ui.js';
 
 const RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3];
+const SLEEP_OPTIONS = [
+  [15, '15 минут'], [30, '30 минут'], [45, '45 минут'], [60, '1 час'],
+  ['chapter', 'До конца главы'], [0, 'Выключить'],
+];
+const SEEK_KEY_MS = 15_000;
 
 export function mount(host) {
   let seeking = false;
@@ -25,14 +30,29 @@ export function mount(host) {
   const silence = el('input', { type: 'checkbox', title: 'Пропускать паузы между репликами' });
   const queueButton = el('button', { class: 'icon-button', title: 'Очередь' }, icon('list-music'));
   const queuePanel = el('div', { class: 'queue-panel', hidden: true });
+  const sleepButton = el('button', { class: 'icon-button sleep-button', title: 'Таймер сна' }, icon('moon'));
+  const sleepMenu = el('div', { class: 'menu-pop sleep-menu', hidden: true },
+    SLEEP_OPTIONS.map(([value, label]) => el('button', {
+      class: 'ghost',
+      onclick: () => {
+        player.setSleepTimer(value);
+        sleepMenu.hidden = true;
+        toast(value ? `Таймер сна: ${label.toLowerCase()}` : 'Таймер сна выключен', 'ok');
+      },
+    }, label)));
 
   host.replaceChildren(
     el('div', { class: 'player-controls' }, prevButton, backButton, playButton, forwardButton, nextButton),
     el('div', { class: 'player-info' }, title, subtitle),
     el('div', { class: 'player-seekbar' }, seek, time),
     el('label', { class: 'row hint' }, silence, 'без пауз'),
-    rate, queueButton, queuePanel,
+    rate, sleepButton, queueButton, queuePanel, sleepMenu,
   );
+
+  sleepButton.onclick = () => {
+    sleepMenu.hidden = !sleepMenu.hidden;
+    queuePanel.hidden = true;
+  };
 
   playButton.onclick = () => player.toggle();
   prevButton.onclick = guard(() => player.previous());
@@ -95,16 +115,40 @@ export function mount(host) {
     rate.value = String(state.rate);
     silence.checked = state.skipSilence;
     nextButton.disabled = state.index + 1 >= state.queue.length;
+
+    // Таймер сна: иконка горит, рядом — сколько осталось.
+    const sleeping = Boolean(state.sleep);
+    sleepButton.classList.toggle('active', sleeping);
+    const label = state.sleep?.mode === 'chapter'
+      ? 'до конца главы'
+      : state.sleepLeftMs !== null ? formatDuration(state.sleepLeftMs) : '';
+    sleepButton.replaceChildren(icon('moon'), sleeping ? el('span', { class: 'sleep-left' }, label) : '');
+    sleepButton.title = sleeping ? `Таймер сна: ${label}` : 'Таймер сна';
     drawQueue(state);
   });
 
-  // Пробел — пуск и пауза, если не набираем текст.
+  // Пробел — пуск и пауза, ← → — перемотка. Только когда не набираем текст.
   document.addEventListener('keydown', (event) => {
-    if (event.code !== 'Space' || !player.snapshot().entry) return;
+    if (!player.snapshot().entry) return;
     if (event.target.matches?.('input, select, textarea, button')) return;
     if (document.querySelector('dialog[open]')) return;
-    event.preventDefault();
-    player.toggle();
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.code === 'Space') {
+      event.preventDefault();
+      player.toggle();
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      player.skip(-SEEK_KEY_MS);
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      player.skip(SEEK_KEY_MS);
+    }
+  });
+
+  document.addEventListener('mousedown', (event) => {
+    if (!sleepMenu.hidden && !sleepMenu.contains(event.target) && !sleepButton.contains(event.target)) {
+      sleepMenu.hidden = true;
+    }
   });
 
   player.loadQueue().catch(() => toast('Не удалось прочитать очередь', 'error'));

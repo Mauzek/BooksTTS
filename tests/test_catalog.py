@@ -13,6 +13,7 @@ import pytest
 
 from audiobook import paths
 from audiobook.core import catalog, repo, secrets
+from audiobook.core.models import Voice
 from audiobook.core.engines import (
     EngineError,
     EngineFatalError,
@@ -201,72 +202,192 @@ def test_elevenlabs_synthesis_asks_for_a_playable_format():
 
 
 # --------------------------------------------------------------------------
-# Qwen3-TTS: локальный Gradio
+# Qwen3-TTS: рабочий процесс в своём окружении
 # --------------------------------------------------------------------------
 
-QWEN_INFO = {
-    "named_endpoints": {
-        "/generate_speech": {
-            "parameters": [
-                {"label": "Text", "parameter_name": "text", "type": {"type": "string"}},
-                {"label": "Voice", "parameter_name": "voice",
-                 "type": {"type": "string", "enum": ["Cherry", "Ryan", "Сергей"]}},
-            ]
-        }
-    }
-}
+# Поддельный рабочий: тот же протокол JSON, что у настоящего, но без модели.
+# Пишет настоящий wav и рядом — запрос, чтобы тест видел, что пришло.
+FAKE_WORKER = r"""
+import json, os, sys, wave
+print("шум библиотек при загрузке", file=sys.stderr, flush=True)
+if sys.argv[1] == "--fail":
+    print(json.dumps({"ready": False, "error": "CUDA недоступна"}), flush=True)
+    sys.exit(1)
+print(json.dumps({"ready": True, "device": "cuda:0"}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    items = request.get("items") or [request]
+    folder = os.path.dirname(items[0]["out"])
+    with open(os.path.join(folder, "batches.log"), "a", encoding="utf-8") as log:
+        log.write(f"{len(items)}\n")
+    if any(item["text"] == "упади" for item in items):
+        sys.exit(3)
+    if any(item["text"] == "сбой" for item in items):
+        print(json.dumps({"id": request["id"], "ok": False, "error": "сбой пачки"}), flush=True)
+        continue
+    for item in items:
+        with wave.open(item["out"], "wb") as handle:
+            handle.setnchannels(1); handle.setsampwidth(2); handle.setframerate(24000)
+            handle.writeframes(b"\0\0" * 2400)
+        with open(item["out"] + ".json", "w", encoding="utf-8") as handle:
+            json.dump({**item, "hf_home": os.environ.get("HF_HOME", "")}, handle, ensure_ascii=False)
+    print(json.dumps({"id": request["id"], "ok": True, "results": [{"ok": True}] * len(items)}), flush=True)
+"""
 
 
-def test_qwen_takes_voices_from_the_running_server():
-    def transport(method, path, **kwargs):
-        assert path in ("/gradio_api/info", "/info")
-        return FakeResponse(QWEN_INFO)
+@pytest.fixture()
+def qwen_worker(tmp_path, library):
+    import sys
 
-    voices = qwen_module.engine({"engine.qwen.transport": transport}).list_voices()
-    assert [v.key for v in voices] == ["Cherry", "Ryan", "Сергей"]
+    script = tmp_path / "fake_worker.py"
+    script.write_text(FAKE_WORKER, encoding="utf-8")
+    yield {"engine.qwen.python": sys.executable, "engine.qwen.worker": str(script)}
+    qwen_module.shutdown()
 
 
-def test_qwen_without_a_server_refuses_instead_of_inventing_voices():
-    """Иначе в каталог попали бы голоса, которыми нечем озвучить."""
-    def transport(method, path, **kwargs):
-        raise EngineError("сервер не отвечает")
+def _last_request():
+    # Имена файлов случайные — «последний» определяем по времени записи.
+    requests = sorted((paths.cache_dir() / "qwen").glob("*.wav.json"),
+                      key=lambda p: p.stat().st_mtime_ns)
+    import json
 
-    engine = qwen_module.engine({"engine.qwen.transport": transport})
-    with pytest.raises(EngineError, match="не отвечает"):
+    return json.loads(requests[-1].read_text(encoding="utf-8")) if requests else None
+
+
+def test_qwen_without_its_environment_says_how_to_install(tmp_path):
+    engine = qwen_module.engine({"engine.qwen.python": str(tmp_path / "нет" / "python.exe")})
+    status = engine.status()
+    assert status["ready"] is False and status["installed"] is False
+    with pytest.raises(EngineError, match="не установлен"):
         engine.list_voices()
-    assert engine.status()["ready"] is False
+    with pytest.raises(EngineFatalError, match="не установлен"):
+        engine.synthesize("Привет", "Ryan")
 
 
-def test_qwen_falls_back_to_built_in_voices_when_the_server_is_terse():
-    """Сервер отвечает, но список голосов в описании не отдал."""
-    def transport(method, path, **kwargs):
-        return FakeResponse({"named_endpoints": {"/tts": {"parameters": [
-            {"label": "Text", "parameter_name": "text", "type": {"type": "string"}},
-        ]}}})
-
-    voices = qwen_module.engine({"engine.qwen.transport": transport}).list_voices()
-    assert {"Vivian", "Ryan", "Sohee"} <= {v.key for v in voices}
-    assert all("встроенный" in v.tags for v in voices)
+def test_qwen_voices_all_speak_russian(qwen_worker):
+    voices = qwen_module.engine(qwen_worker).list_voices()
+    assert {"Ryan", "Serena", "Uncle_Fu", "Vivian"} <= {v.key for v in voices}
+    assert all(v.language == "ru" for v in voices)
+    assert {v.gender for v in voices} == {"м", "ж"}
 
 
-def test_qwen_supports_russian():
-    assert qwen_module.engine({}).supports_language("ru")
+def test_qwen_synthesis_goes_through_the_worker(qwen_worker):
+    data, extension = qwen_module.engine(qwen_worker).synthesize("Привет", "Ryan")
+    assert extension == "wav" and data[:4] == b"RIFF"
+    request = _last_request()
+    assert request["language"] == "Russian" and request["speaker"] == "Ryan"
+    # Временный файл за собой убран.
+    assert not list((paths.cache_dir() / "qwen").glob("*.wav"))
 
 
-def test_qwen_downloads_the_generated_file():
-    def transport(method, path, **kwargs):
-        if path.endswith("/info"):
-            return FakeResponse(QWEN_INFO)
-        if path == "/gradio_api/call/generate_speech":
-            return FakeResponse({"event_id": "e1"})
-        if path == "/gradio_api/call/generate_speech/e1":
-            return FakeResponse(text='event: complete\ndata: [{"path": "/tmp/out.wav"}]\n')
-        if path == "/gradio_api/file=/tmp/out.wav":
-            return FakeResponse(content=b"RIFFwav")
-        raise AssertionError(f"неожиданный путь {path}")
+def test_emotion_becomes_an_intonation_instruction(qwen_worker):
+    qwen_module.engine(qwen_worker).synthesize("Уходи", "Ryan", emotion="зло")
+    assert "зло" in _last_request()["instruct"].lower()
+    qwen_module.engine(qwen_worker).synthesize("Привет", "Ryan", emotion="нейтрально")
+    assert _last_request()["instruct"] == ""
 
-    engine = qwen_module.engine({"engine.qwen.transport": transport})
-    assert engine.synthesize("Привет", "Cherry") == (b"RIFFwav", "wav")
+
+def test_worker_is_started_once_and_reused(qwen_worker):
+    engine = qwen_module.engine(qwen_worker)
+    engine.synthesize("Раз", "Ryan")
+    worker = engine._worker()
+    pid = worker.process.pid
+    engine.synthesize("Два", "Serena")
+    assert worker.process.pid == pid
+    assert "загружена" in engine.status()["detail"]
+
+
+def test_model_that_failed_to_load_is_reported(qwen_worker):
+    options = {**qwen_worker, "engine.qwen.model": "--fail"}
+    with pytest.raises(EngineFatalError, match="CUDA недоступна"):
+        qwen_module.engine(options).synthesize("Привет", "Ryan")
+
+
+def test_crashed_worker_is_restarted_on_the_next_line(qwen_worker):
+    engine = qwen_module.engine(qwen_worker)
+    with pytest.raises(EngineError, match="завершился"):
+        engine.synthesize("упади", "Ryan")
+    data, _ = engine.synthesize("Живой", "Ryan")
+    assert data[:4] == b"RIFF"
+
+
+def test_unknown_qwen_voice_is_refused(qwen_worker):
+    with pytest.raises(EngineFatalError, match="нет голоса"):
+        qwen_module.engine(qwen_worker).synthesize("Привет", "Cherry")
+
+
+def _qwen_chapter(conn, marked, qwen_worker, batch):
+    """Все роли главы — на голосе Qwen, рабочий поддельный."""
+    for key, value in {**qwen_worker, "engine.qwen.batch": batch}.items():
+        repo.set_setting(conn, key, value)
+    voice = repo.upsert_voice(conn, Voice(engine="qwen", voice_key="Ryan", display_name="Ryan"))
+    for speaker in repo.book_speakers(conn, marked.book_id):
+        repo.set_cast(conn, marked.book_id, speaker, voice.id)
+
+
+def _batches() -> list[int]:
+    log = paths.cache_dir() / "qwen" / "batches.log"
+    return [int(n) for n in log.read_text(encoding="utf-8").split()] if log.exists() else []
+
+
+def test_qwen_lines_are_voiced_in_batches(conn, marked, qwen_worker):
+    """Пачка из восьми идёт в пять раз быстрее, чем восемь по одной."""
+    from audiobook.core import synth
+
+    _qwen_chapter(conn, marked, qwen_worker, batch=2)
+    result = synth.synthesize_chapter(conn, marked.id)
+    assert result["done"] == 5 and result["failed"] == []
+    assert _batches() == [2, 2, 1]
+    assert all(s.audio_path for s in repo.list_segments(conn, marked.id))
+
+
+def test_failed_batch_is_retried_line_by_line(conn, marked, qwen_worker, monkeypatch):
+    """Одна кривая реплика не должна губить остальные в своей пачке."""
+    from audiobook.core import synth
+
+    monkeypatch.setattr(synth, "BACKOFF", (0.0, 0.0))
+    _qwen_chapter(conn, marked, qwen_worker, batch=2)
+    bad = repo.list_segments(conn, marked.id)[1]
+    repo.update_segment(conn, bad.id, text="сбой")
+
+    result = synth.synthesize_chapter(conn, marked.id)
+    assert [f["segment_id"] for f in result["failed"]] == [bad.id]
+    voiced = [s for s in repo.list_segments(conn, marked.id) if s.audio_path]
+    assert len(voiced) == 4
+
+
+def test_qwen_home_holds_both_environment_and_model(qwen_worker, tmp_path):
+    """Папку Qwen можно вынести на другой диск: окружение и модель живут вместе."""
+    home = tmp_path / "E" / "llm" / "BookTTS-qwen"
+    engine = qwen_module.engine({"engine.qwen.home": str(home)})
+    assert engine.python == qwen_module.python_in(home)
+    assert engine.status()["installed"] is False
+    assert str(home) in engine.status()["detail"]
+
+    (home / "huggingface").mkdir(parents=True)
+    qwen_module.engine({**qwen_worker, "engine.qwen.home": str(home)}).synthesize("Привет", "Ryan")
+    assert _last_request()["hf_home"] == str(home / "huggingface")
+
+
+def test_without_its_own_model_folder_the_shared_cache_is_used(qwen_worker, tmp_path):
+    """Иначе у тех, кто ничего не переносил, модель скачалась бы заново."""
+    import os
+
+    options = {**qwen_worker, "engine.qwen.home": str(tmp_path / "без-модели")}
+    qwen_module.engine(options).synthesize("Привет", "Ryan")
+    assert _last_request()["hf_home"] == os.environ.get("HF_HOME", "")
+
+
+def test_only_qwen_hears_emotions():
+    from audiobook.core.engines import uses_emotion
+
+    assert uses_emotion("qwen") is True
+    assert uses_emotion("silero") is False
+
+
+def test_worker_file_is_not_mistaken_for_an_engine():
+    """Рабочий скрипт подменяет stdout — импортировать его при поиске движков нельзя."""
+    assert "_qwen_worker" not in engine_names()
 
 
 # --------------------------------------------------------------------------

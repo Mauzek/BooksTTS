@@ -10,15 +10,18 @@ from __future__ import annotations
 import difflib
 import hashlib
 import sqlite3
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
 from .. import paths
+from . import gender as gender_mod
 from . import repo
 from .engines import EngineError, VoiceEngine, engine_names, get_engine
 from .engines import elevenlabs as elevenlabs_engine
 from .engines import qwen as qwen_engine
 from .engines import silero as silero_engine
+from .markup import DEFAULT_MODEL as DEFAULT_MARKUP_MODEL
 from .models import NARRATOR, CastEntry, Voice
 
 __all__ = [
@@ -44,9 +47,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "engine.silero.model": silero_engine.DEFAULT_MODEL,
     "engine.silero.device": "cpu",
     "engine.elevenlabs.model": elevenlabs_engine.DEFAULT_MODEL,
-    "engine.qwen.url": qwen_engine.DEFAULT_URL,
+    # Папка Qwen: окружение и модель. Пусто — %LOCALAPPDATA%\BookTTS-qwen.
+    "engine.qwen.home": "",
+    "engine.qwen.model": qwen_engine.DEFAULT_MODEL,
     "preview.text": "Дождь кончился час назад, но крыши всё ещё роняли воду.",
     "synthesis.parallelism": 1,
+    # Разметка по ролям. Адрес пустой — официальный API Anthropic (или
+    # ANTHROPIC_BASE_URL из окружения, если он задан).
+    "anthropic.base_url": "",
+    "anthropic.model": DEFAULT_MARKUP_MODEL,
 }
 
 # Варианты для выпадающих списков в настройках. Там, где список зависит от
@@ -54,6 +63,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 CHOICES: dict[str, list[str]] = {
     "engine.silero.model": list(silero_engine.MODELS),
     "engine.silero.device": ["cpu", "cuda"],
+    # 1.7B звучит лучше, 0.6B вдвое легче для видеопамяти.
+    "engine.qwen.model": [qwen_engine.DEFAULT_MODEL, "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"],
 }
 
 # Похожие имена персонажей при переносе профиля: «Велимир» и «Велемир» — один
@@ -84,7 +95,9 @@ def save_settings(conn: Conn, values: dict[str, Any]) -> dict[str, Any]:
             # Иначе ошибка всплыла бы через полчаса, посреди озвучки книги.
             raise repo.InvalidOperation(problem)
     for key, value in values.items():
-        if key in DEFAULT_SETTINGS or key.startswith("engine."):
+        if key in DEFAULT_SETTINGS or key.startswith(("engine.", "anthropic.")):
+            if isinstance(value, str):
+                value = value.strip()
             repo.set_setting(conn, key, value)
     return settings(conn)
 
@@ -217,6 +230,7 @@ def cast_view(conn: Conn, book_id: int) -> dict[str, Any]:
     """Персонажи книги с назначенными голосами — для экрана голосов."""
     book = repo.get_book(conn, book_id)
     assigned = repo.cast_map(conn, book_id)
+    genders = speaker_genders(conn, book_id)
     speakers = []
     for name, count in repo.book_speakers(conn, book_id).items():
         entry = assigned.get(name)
@@ -224,6 +238,8 @@ def cast_view(conn: Conn, book_id: int) -> dict[str, Any]:
             "name": name,
             "count": count,
             "is_narrator": name == NARRATOR,
+            "gender": genders.get(name, {}).get("gender", ""),
+            "gender_source": genders.get(name, {}).get("source", ""),
             "cast": entry.to_dict() if entry else None,
             "voice": entry.voice.to_dict() if entry and entry.voice else None,
             "preview_url": preview_url(entry.voice) if entry and entry.voice else "",
@@ -237,6 +253,22 @@ def assign(conn: Conn, book_id: int, speaker: str, voice_id: int | None,
     if voice_id is not None:
         repo.get_voice(conn, voice_id)  # 404, если голоса нет
     return repo.set_cast(conn, book_id, speaker, voice_id, rate, pitch, volume)
+
+
+def speaker_genders(conn: Conn, book_id: int) -> dict[str, dict[str, Any]]:
+    """Пол каждого персонажа книги — по глаголам рядом с его именем в тексте."""
+    texts = [chapter.text for chapter in repo.list_chapters(conn, book_id)]
+    return {
+        speaker: gender_mod.evidence(speaker, texts)
+        for speaker in repo.book_speakers(conn, book_id)
+        if speaker != NARRATOR
+    }
+
+
+# Высота голоса для второй, третьей, четвёртой роли на одном голосе. Замерено
+# на silero v5_5_ru: pitch 1.2 поднимает основной тон с 91 до 113 Гц, а вниз
+# он почти не сдвигается (0.85 даёт 87 Гц) — поэтому только вверх.
+PITCH_VARIANTS = (1.0, 1.15, 1.3, 1.08)
 
 
 def _stable_index(name: str, size: int) -> int:
@@ -260,20 +292,39 @@ def auto_assign(conn: Conn, book_id: int, engine: str = "silero",
     assigned = repo.cast_map(conn, book_id)
     narrator_voice = next((v for v in voices if v.gender == "м"), voices[0])
     others = [v for v in voices if v.id != narrator_voice.id] or voices
+    genders = speaker_genders(conn, book_id)
+    speakers = list(repo.book_speakers(conn, book_id))
+
+    # Сколько ролей уже звучат каждым голосом — включая оставленные как есть.
+    uses: Counter = Counter()
+    taken: set[int] = set()
+    for speaker, entry in assigned.items():
+        if speaker in speakers and entry.voice_id and not overwrite:
+            uses[entry.voice_id] += 1
+            taken.add(entry.voice_id)
 
     result = []
-    taken: set[int] = set()
-    for speaker in repo.book_speakers(conn, book_id):
+    for speaker in speakers:
         if speaker in assigned and not overwrite:
             continue
+        gender = genders.get(speaker, {}).get("gender", "")
         if speaker == NARRATOR:
             voice = narrator_voice
         else:
-            free = [v for v in others if v.id not in taken] or others
+            # Сначала голоса того же пола: «сказал Терех» — значит, мужской.
+            # Пол неизвестен — выбираем из всех, как раньше.
+            pool = [v for v in others if v.gender == gender] if gender else others
+            pool = pool or others
+            free = [v for v in pool if v.id not in taken] or pool
             voice = free[_stable_index(speaker, len(free))]
             taken.add(voice.id)
-        repo.set_cast(conn, book_id, speaker, voice.id)
-        result.append({"speaker": speaker, "voice": voice.to_dict()})
+        # Голос уже занят — тот же голос, но выше: два персонажа одного пола
+        # в одной сцене иначе звучали бы одинаково.
+        pitch = PITCH_VARIANTS[uses[voice.id] % len(PITCH_VARIANTS)]
+        uses[voice.id] += 1
+        repo.set_cast(conn, book_id, speaker, voice.id, pitch=pitch)
+        result.append({"speaker": speaker, "voice": voice.to_dict(), "gender": gender,
+                       "pitch": pitch, "shared": uses[voice.id] > 1})
     return result
 
 

@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "../backend-dist/booktts-backend/": "backend/"
+    }
+  }
+}

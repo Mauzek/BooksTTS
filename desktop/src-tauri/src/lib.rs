@@ -4,6 +4,7 @@
 //! и гасит бэкенд при выходе. Вся логика — в `audiobook/core`.
 
 mod backend;
+mod updates;
 
 use tauri::{Manager, RunEvent};
 
@@ -19,6 +20,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(backend::Backend::default())
         .setup(|app| {
             backend::spawn(app.handle().clone());
@@ -26,7 +28,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             backend::backend_status,
-            backend::restart_backend
+            backend::restart_backend,
+            updates::app_version,
+            updates::check_update,
+            updates::install_update
         ])
         .build(tauri::generate_context!())
         .expect("не удалось собрать приложение");

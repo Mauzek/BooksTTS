@@ -25,9 +25,10 @@ function flattenBooks(tree) {
   return books;
 }
 
-export function render(view) {
+export function render(view, bookId = null) {
   let alive = true;
-  const state = { voices: [], engines: [], bookId: remembered(), cast: null, phrase: '' };
+  // Пришли из карточки книги — открываем её роли, иначе ту, что смотрели последней.
+  const state = { voices: [], engines: [], bookId: bookId || remembered(), cast: null, phrase: '' };
 
   const engineHost = el('div', { class: 'engine-cards' });
   const filters = {
@@ -198,7 +199,16 @@ export function render(view) {
     },
       el('div', { class: 'row' },
         el('b', { class: 'grow' }, speaker.name === 'narrator' ? 'рассказчик' : speaker.name),
+        speaker.gender
+          ? el('span', {
+            class: 'badge',
+            title: speaker.gender_source === 'text'
+              ? 'Пол определён по глаголам рядом с именем в тексте'
+              : 'Пол угадан по окончанию имени',
+          }, speaker.gender + (speaker.gender_source === 'text' ? '' : '?'))
+          : null,
         el('span', { class: 'hint' }, plural(speaker.count, 'реплика', 'реплики', 'реплик'))),
+      shareNote(speaker),
       el('div', { class: 'row' },
         speaker.voice
           ? el('span', { class: 'voice-chip' }, `${speaker.voice.label} · ${speaker.voice.engine}`)
@@ -239,6 +249,27 @@ export function render(view) {
       if (voiceId) assignVoice(voiceId, speaker.name);
     });
     return row;
+  }
+
+  /** С кем роль делит голос. Одинаковая высота — звучат неразличимо. */
+  function shareNote(speaker) {
+    if (!speaker.cast?.voice_id) return null;
+    const twins = state.cast.speakers.filter((other) => other.name !== speaker.name
+      && other.cast?.voice_id === speaker.cast.voice_id);
+    if (!twins.length) return null;
+    const same = twins.filter((other) => Math.abs(other.cast.pitch - speaker.cast.pitch) < 0.03);
+    // Имя в кавычках после «роль» не нужно склонять: «у роли «Велимир»», а не «у Велимир».
+    const names = (list) => list
+      .map((o) => (o.name === 'narrator' ? 'рассказчик' : `«${o.name}»`)).join(', ');
+    return same.length
+      ? el('div', { class: 'hint warn' }, icon('triangle-alert', { size: 12 }),
+        ` звучит одинаково с ${list(same)} — измените высоту или голос`)
+      : el('div', { class: 'hint' }, `общий голос с ${list(twins)}, но другая высота`);
+
+    // «с ролью «Велимир»», «с ролями «Велимир», «Терех»» — творительный падеж после «с».
+    function list(items) {
+      return `${items.length > 1 ? 'ролями' : 'ролью'} ${names(items)}`;
+    }
   }
 
   function sliders(speaker) {

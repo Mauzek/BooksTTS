@@ -12,3 +12,15 @@ venv/
 # десктоп: артефакты Tauri (сам target/ уводится из OneDrive через CARGO_TARGET_DIR)
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
+
+# сборка
+desktop/backend-dist/
+build/
+*.key
+*.key.pub
+
+# старый формат голосов первой версии, приложение его не читает
+voices.yaml
+
+# образцы голосов для сравнения на слух
+samples-qwen/

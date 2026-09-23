@@ -1,8 +1,8 @@
 // Настройки: ключи API в системном хранилище и параметры движков.
 
-import { del, get, post, put } from '../api.js';
+import { del, get, post, put, tauri } from '../api.js';
 import { THEMES, applyTheme, currentTheme } from '../theme.js';
-import { confirmAction, el, guard, toast } from '../ui.js';
+import { confirmAction, el, emit, guard, icon, toast } from '../ui.js';
 
 export function render(view) {
   let alive = true;
@@ -10,7 +10,29 @@ export function render(view) {
   view.replaceChildren(page);
 
   const tokensHost = el('div', { class: 'list' });
+  const markupHost = el('div', { class: 'list' });
   const settingsHost = el('div', { class: 'list' });
+  const aboutHost = el('div', { class: 'list' });
+
+  const loadAbout = guard(async () => {
+    const config = await get('/api/config');
+    const shell = tauri?.core?.invoke ? await tauri.core.invoke('app_version').catch(() => '') : '';
+    if (!alive) return;
+    aboutHost.replaceChildren(
+      el('div', { class: 'list-row settings-row' },
+        el('div', { class: 'title' },
+          el('div', {}, `BookTTS ${shell || config.version}`),
+          el('div', { class: 'sub' },
+            shell ? 'Обновления приходят из GitHub Releases и проверяются по подписи.'
+              : 'Режим разработки: обновления проверяет только установленное приложение.')),
+        el('div', { class: 'row grow' },
+          el('button', { onclick: () => emit('check-updates') }, icon('refresh-cw'), 'Проверить обновления'))),
+      el('div', { class: 'list-row settings-row' },
+        el('div', { class: 'title' },
+          el('div', {}, 'Папка библиотеки'),
+          el('div', { class: 'sub' }, 'База, копии книг и озвучка. Её можно перенести целиком — пути внутри относительные.')),
+        el('div', { class: 'row grow' }, el('code', { class: 'path' }, config.library))));
+  });
 
   function themeRow() {
     const select = el('select', { class: 'grow' }, THEMES.map(([name, label]) =>
@@ -32,8 +54,12 @@ export function render(view) {
       'Ключи хранятся в системном хранилище паролей Windows, не в базе и не в открытом файле. ',
       'Приложение показывает только последние символы.'),
     tokensHost,
+    el('h2', {}, 'Разметка по ролям'),
+    markupHost,
     el('h2', {}, 'Движки синтеза'),
     settingsHost,
+    el('h2', {}, 'О программе'),
+    aboutHost,
   );
 
   const loadTokens = guard(async () => {
@@ -92,17 +118,23 @@ export function render(view) {
   const loadSettings = guard(async () => {
     const data = await get('/api/settings');
     if (!alive) return;
-    const rows = Object.keys(data.defaults)
-      .filter((key) => key.startsWith('engine.') || key === 'preview.text')
-      .map((key) => settingRow(key, data));
-    settingsHost.replaceChildren(...rows);
+    const keys = Object.keys(data.defaults);
+    markupHost.replaceChildren(...keys.filter((key) => key.startsWith('anthropic.'))
+      .map((key) => settingRow(key, data)));
+    settingsHost.replaceChildren(...keys
+      .filter((key) => key.startsWith('engine.') || key === 'preview.text' || key === 'synthesis.parallelism')
+      .map((key) => settingRow(key, data)));
   });
 
   const LABELS = {
+    'anthropic.base_url': ['Адрес API', 'Пусто — официальный API Anthropic. Для прокси — его адрес, например https://…:8443.'],
+    'anthropic.model': ['Модель разметки', 'Какой моделью Claude размечать главы по ролям.'],
+    'synthesis.parallelism': ['Параллельность синтеза', 'Сколько реплик озвучивать одновременно. Для Silero обычно 1, для облака — 2–4.'],
     'engine.silero.model': ['Модель Silero', 'Новее звучит чище; смена модели заставит переозвучить реплики.'],
     'engine.silero.device': ['Устройство Silero', 'cuda — если есть подходящая видеокарта.'],
     'engine.elevenlabs.model': ['Модель ElevenLabs', 'Например, eleven_multilingual_v2.'],
-    'engine.qwen.url': ['Адрес Qwen3-TTS', 'Локальный сервер Gradio, который вы запускаете сами.'],
+    'engine.qwen.home': ['Папка Qwen3-TTS', 'Окружение и модель (~9 ГБ). Пусто — %LOCALAPPDATA%\\BookTTS-qwen. Можно вынести на другой диск: папку переносят целиком и указывают здесь.'],
+    'engine.qwen.model': ['Модель Qwen3-TTS', '1.7B звучит лучше, 0.6B вдвое легче для видеопамяти.'],
     'preview.text': ['Фраза для прослушивания', 'Ей озвучиваются образцы голосов.'],
   };
 
@@ -128,5 +160,6 @@ export function render(view) {
   draw();
   loadTokens();
   loadSettings();
+  loadAbout();
   return () => { alive = false; };
 }

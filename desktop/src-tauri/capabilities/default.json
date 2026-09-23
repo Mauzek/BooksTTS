@@ -10,6 +10,11 @@
     "core:default",
     "notification:default",
     "dialog:allow-open",
-    "dialog:allow-save"
+    "dialog:allow-save",
+    "allow-backend-status",
+    "allow-restart-backend",
+    "allow-app-version",
+    "allow-check-update",
+    "allow-install-update"
   ]
 }

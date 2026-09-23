@@ -1,0 +1,72 @@
+# Релиз: тег v* -> тесты -> бэкенд (PyInstaller) -> установщик (Tauri, NSIS)
+# -> GitHub Release с latest.json, по которому приложение находит обновление.
+#
+# Нужны секреты репозитория:
+#   TAURI_SIGNING_PRIVATE_KEY           — содержимое %USERPROFILE%\.tauri\booktts.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  — пароль к нему
+# Без подписи приложение обновление не примет.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      # Консоль Windows-сборщика — cp1252: кириллица в выводе тестов иначе
+      # превращается в UnicodeEncodeError вместо сообщения об ошибке.
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Зависимости Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest "pyinstaller>=6.10"
+
+      - name: Тесты
+        run: python -m pytest tests -q -p no:cacheprovider
+
+      - name: Сборка бэкенда
+        run: python -m PyInstaller desktop/backend.spec --noconfirm --distpath desktop/backend-dist --workpath build/pyinstaller
+
+      - name: Бэкенд запускается
+        run: desktop/backend-dist/booktts-backend/booktts-backend.exe --version
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: desktop
+          tauriScript: npx --yes @tauri-apps/cli@2
+          # Бэкенд кладётся в установщик только при релизной сборке: в режиме
+          # разработки он запускается из исходников.
+          args: --config src-tauri/tauri.release.json
+          tagName: ${{ github.ref_name }}
+          releaseName: BookTTS ${{ github.ref_name }}
+          releaseBody: Установщик для Windows. Уже установленное приложение обновится само.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true

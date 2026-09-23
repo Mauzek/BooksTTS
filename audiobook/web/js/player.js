@@ -21,7 +21,11 @@ const state = {
   rate: 1,
   skipSilence: false,
   error: '',
+  sleep: null,       // таймер сна: {mode: 'time', endsAt} или {mode: 'chapter'}
 };
+
+const FADE_MS = 10_000;  // последние секунды перед сном громкость плавно уходит
+let sleepTimer = null;
 
 function loadSettings() {
   try {
@@ -60,7 +64,40 @@ export function snapshot() {
     positionMs: audio.currentTime * 1000,
     durationMs: (audio.duration || 0) * 1000 || state.entry?.duration_ms || 0,
     segment: currentSegment(),
+    sleepLeftMs: state.sleep?.mode === 'time' ? Math.max(0, state.sleep.endsAt - Date.now()) : null,
   };
+}
+
+// ---------- таймер сна ----------
+
+function clearSleep() {
+  clearTimeout(sleepTimer);
+  sleepTimer = null;
+  state.sleep = null;
+  audio.volume = 1;
+}
+
+/** Уснуть через ``minutes`` минут; ``'chapter'`` — в конце главы; 0 — выключить. */
+export function setSleepTimer(minutes) {
+  clearSleep();
+  if (minutes === 'chapter') {
+    state.sleep = { mode: 'chapter' };
+  } else if (Number(minutes) > 0) {
+    const duration = Number(minutes) * 60_000;
+    state.sleep = { mode: 'time', endsAt: Date.now() + duration };
+    sleepTimer = setTimeout(() => {
+      audio.pause();
+      clearSleep();
+      publish();
+    }, duration);
+  }
+  publish();
+}
+
+function fadeBeforeSleep() {
+  if (state.sleep?.mode !== 'time') return;
+  const left = state.sleep.endsAt - Date.now();
+  audio.volume = left < FADE_MS ? Math.max(0, left / FADE_MS) : 1;
 }
 
 export function currentSegment() {
@@ -250,6 +287,7 @@ function skipSilenceIfNeeded() {
 
 audio.addEventListener('timeupdate', () => {
   skipSilenceIfNeeded();
+  fadeBeforeSleep();
   savePosition();
   publish();
 });
@@ -257,6 +295,12 @@ audio.addEventListener('play', () => { updateMediaSession(); publish(); });
 audio.addEventListener('pause', () => { savePosition(true); publish(); });
 audio.addEventListener('ended', () => {
   savePosition(true);
+  if (state.sleep?.mode === 'chapter') {
+    // «До конца главы»: следующую не начинаем.
+    clearSleep();
+    publish();
+    return;
+  }
   next().catch(() => { /* очередь кончилась */ });
 });
 audio.addEventListener('error', () => {

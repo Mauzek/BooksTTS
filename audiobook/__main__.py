@@ -255,6 +255,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.library:
         paths.set_library_root(args.library)
+    adopted = paths.adopt_legacy_library()
+    if adopted is not None:
+        # В stderr: stdout бэкенда читает оболочка, там место только строке готовности.
+        print(f"Библиотека скопирована из {adopted} в {paths.library_root()}", file=sys.stderr)
     paths.ensure_layout()
     db = Database().setup()
 

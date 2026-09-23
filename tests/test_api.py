@@ -553,6 +553,48 @@ def test_pronunciation_rules_round_trip(http, marked):
     assert left["rules"] == []
 
 
+# --------------------------------------------------------------------------
+# Готовность, «продолжить слушать», разметка книги
+# --------------------------------------------------------------------------
+
+
+def test_readiness_route_names_missing_voices(http, marked):
+    data = http.get(f"/api/books/{marked.book_id}/readiness").json()
+    assert data["ready"] is False
+    assert {m["speaker"] for m in data["missing_voice"]} == {"narrator", "Велимир", "Аглая"}
+
+
+def test_readiness_becomes_ready_after_auto_cast(http, engine, marked):
+    http.post("/api/engines/refresh", json={})
+    http.post(f"/api/books/{marked.book_id}/cast/auto", json={})
+    assert http.get(f"/api/books/{marked.book_id}/readiness").json()["ready"] is True
+
+
+def test_single_job_can_be_followed(http, engine, marked):
+    http.post("/api/engines/refresh", json={})
+    http.post(f"/api/books/{marked.book_id}/cast/auto", json={})
+    job = http.post(f"/api/chapters/{marked.id}/synthesize", json={}).json()
+    assert http.get(f"/api/jobs/{job['id']}").json()["status"] == "pending"
+    assert http.get("/api/jobs/999").status_code == 404
+
+
+def test_book_markup_is_queued(http, marked):
+    job = http.post(f"/api/books/{marked.book_id}/markup", json={}).json()
+    assert job["kind"] == "markup_book" and "Разметка книги" in job["title"]
+
+
+def test_continue_lists_books_being_listened(http, marked):
+    http.put(f"/api/books/{marked.book_id}/playback", json={"chapter_id": marked.id, "position_ms": 500})
+    items = http.get("/api/continue").json()["items"]
+    assert items[0]["book_id"] == marked.book_id
+    assert items[0]["chapter_label"].startswith("Глава 1")
+
+
+def test_markup_settings_are_saved(http):
+    http.put("/api/settings", json={"values": {"anthropic.base_url": "  https://proxy:8443  "}})
+    assert http.get("/api/settings").json()["settings"]["anthropic.base_url"] == "https://proxy:8443"
+
+
 def test_ready_line_is_parseable(library):
     import json
 

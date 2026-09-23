@@ -21,7 +21,7 @@ from typing import Any, Callable, Sequence
 from .. import paths
 from . import assemble as assemble_mod
 from . import catalog, pronounce, repo
-from .engines import EngineError, EngineFatalError
+from .engines import EngineError, EngineFatalError, uses_emotion
 from .models import CastEntry, Segment, segment_hash
 
 __all__ = [
@@ -76,12 +76,19 @@ def plan(conn: Conn, chapter_id: int, force: bool = False) -> dict[str, Any]:
         if s.speaker not in cast or cast[s.speaker].voice is None
     })
     pending: list[tuple[Segment, CastEntry, str, str]] = []
+    emotional: dict[str, bool] = {}
     for segment in segments:
         entry = cast.get(segment.speaker)
         if entry is None or entry.voice is None:
             continue
         text = pronounce.apply(segment.text, rules)
-        key = segment_hash(text, entry.voice_key)
+        engine = entry.voice.engine
+        if engine not in emotional:
+            emotional[engine] = uses_emotion(engine)
+        # Эмоция в отпечатке — только там, где она меняет звук. Иначе правка
+        # эмоции объявила бы устаревшей озвучку Silero, которой она безразлична.
+        fingerprint = f"{text}␞{segment.emotion}" if emotional[engine] else text
+        key = segment_hash(fingerprint, entry.voice_key)
         if not force and segment.audio_hash == key and _has_audio(segment):
             continue
         pending.append((segment, entry, text, key))
@@ -140,12 +147,14 @@ def synthesize_chapter(
     def render(task) -> tuple[Any, bytes, str]:
         segment, entry, text, _key = task
         engine = engine_for(entry.voice.engine)
+        # Эмоцию передаём только тем движкам, что её понимают.
+        hints = {"emotion": segment.emotion} if getattr(engine, "uses_emotion", False) else {}
         last: Exception | None = None
         for attempt in range(ATTEMPTS):
             try:
                 data, extension = engine.synthesize(
                     text, entry.voice.voice_key,
-                    rate=entry.rate, pitch=entry.pitch, volume=entry.volume,
+                    rate=entry.rate, pitch=entry.pitch, volume=entry.volume, **hints,
                 )
                 return task, data, extension
             except EngineFatalError as exc:
@@ -192,6 +201,59 @@ def synthesize_chapter(
         failed.append({"segment_id": segment.id, "error": str(exc)})
         if commit_each:
             conn.commit()
+
+    def report() -> None:
+        if on_progress:
+            on_progress(done, total)
+
+    # Движки, которые умеют пачками (Qwen), получают реплики пачками: одна
+    # фраза почти не нагружает видеокарту, пачка из восьми идёт в пять раз
+    # быстрее. Остальные реплики — обычным путём ниже.
+    batched: dict[str, list] = {}
+    rest = []
+    for task in tasks:
+        name = task[1].voice.engine
+        engine = engine_for(name)
+        if getattr(engine, "batch_size", 1) > 1 and hasattr(engine, "synthesize_batch"):
+            batched.setdefault(name, []).append(task)
+        else:
+            rest.append(task)
+
+    for name, group in batched.items():
+        engine = engine_for(name)
+        for start in range(0, len(group), engine.batch_size):
+            if should_stop and should_stop():
+                cancelled = True
+                break
+            chunk = group[start : start + engine.batch_size]
+            try:
+                outputs: list = engine.synthesize_batch([
+                    {"text": task[2], "voice_key": task[1].voice.voice_key,
+                     "emotion": task[0].emotion}
+                    for task in chunk
+                ])
+            except EngineFatalError as exc:
+                outputs = [exc] * len(chunk)
+            except EngineError:
+                # Пачка упала целиком — повторяем по одной, чтобы одна кривая
+                # реплика не губила семь нормальных.
+                outputs = [None] * len(chunk)
+            for task, output in zip(chunk, outputs):
+                try:
+                    if isinstance(output, tuple):
+                        store(task, *output)
+                    elif isinstance(output, Exception):
+                        raise SynthError(str(output)) from output
+                    else:
+                        _task, data, extension = render(task)
+                        store(task, data, extension)
+                except Exception as exc:  # noqa: BLE001 — ошибка одной реплики
+                    fail(task, exc)
+                done += 1
+                report()
+        if cancelled:
+            break
+    tasks = [] if cancelled else rest
 
     if parallelism > 1 and tasks:
         # Движок зовём из нескольких потоков, а в базу пишем из одного:

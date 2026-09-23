@@ -92,6 +92,16 @@ def engine_names() -> list[str]:
     return sorted(_modules())
 
 
+def uses_emotion(name: str) -> bool:
+    """Меняет ли эмоция реплики звук у этого движка.
+
+    Спрашивается без создания движка: нужно при расчёте отпечатка реплики,
+    а тот считается для каждой реплики главы.
+    """
+    module = _modules().get(name)
+    return bool(getattr(module, "USES_EMOTION", False))
+
+
 def get_engine(name: str, options: dict[str, Any] | None = None) -> VoiceEngine:
     module = _modules().get(name)
     if module is None:

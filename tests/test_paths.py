@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from audiobook import paths
@@ -75,6 +77,48 @@ def test_root_is_always_resolved(monkeypatch, tmp_path):
         assert root == root.resolve()
     finally:
         paths.set_library_root(None)
+
+
+@pytest.fixture()
+def store_python_library(tmp_path, monkeypatch):
+    """Библиотека в песочнице Store-Python и пустой «настоящий» %APPDATA%."""
+    local = tmp_path / "Local"
+    legacy = local / "Packages" / "PythonSoftwareFoundation.Python.3.11_x" / "LocalCache" / "Roaming" / "BookTTS"
+    (legacy / "books").mkdir(parents=True)
+    (legacy / "library.db").write_bytes(b"SQLite format 3\x00")
+    (legacy / "books" / "книга.txt").write_text("текст", encoding="utf-8")
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.delenv(paths.ENV_VAR, raising=False)
+    monkeypatch.chdir(tmp_path)  # без ./library рядом
+    paths.set_library_root(None)
+    yield legacy
+    paths.set_library_root(None)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="песочница Store-Python есть только в Windows")
+def test_store_python_library_is_copied_on_first_run(store_python_library, tmp_path):
+    source = paths.adopt_legacy_library()
+    target = paths.library_root()
+    assert source == store_python_library
+    assert target == (tmp_path / "Roaming" / "BookTTS").resolve()
+    assert (target / "books" / "книга.txt").read_text(encoding="utf-8") == "текст"
+    # Копия, а не перенос: старая остаётся на месте.
+    assert (store_python_library / "library.db").is_file()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="песочница Store-Python есть только в Windows")
+def test_existing_library_is_never_overwritten(store_python_library, tmp_path):
+    target = tmp_path / "Roaming" / "BookTTS"
+    target.mkdir(parents=True)
+    (target / "library.db").write_bytes(b"mine")
+    assert paths.adopt_legacy_library() is None
+    assert (target / "library.db").read_bytes() == b"mine"
+
+
+def test_explicit_root_skips_adoption(store_python_library, tmp_path):
+    paths.set_library_root(tmp_path / "явная")
+    assert paths.adopt_legacy_library() is None
 
 
 def test_sibling_directory_is_not_inside(library):

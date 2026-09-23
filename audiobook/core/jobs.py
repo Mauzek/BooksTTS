@@ -19,6 +19,7 @@ from . import export as export_mod
 from . import library, repo, synth
 from .catalog import settings
 from .db import Database
+from .markup import MarkupConfigError
 from .models import Job, JobStatus
 
 __all__ = ["JobQueue", "KIND_MARKUP", "KIND_SYNTHESIS", "KIND_BOOK", "KIND_FOLDER", "KINDS"]
@@ -30,7 +31,8 @@ KIND_SYNTHESIS = "synthesis"  # одна глава
 KIND_BOOK = "book"  # вся книга
 KIND_FOLDER = "folder"  # все книги папки
 KIND_EXPORT = "export"  # m4b, mp3 или разметка
-KINDS = (KIND_MARKUP, KIND_SYNTHESIS, KIND_BOOK, KIND_FOLDER, KIND_EXPORT)
+KIND_MARKUP_BOOK = "markup_book"  # разметка всех глав книги
+KINDS = (KIND_MARKUP, KIND_SYNTHESIS, KIND_BOOK, KIND_FOLDER, KIND_EXPORT, KIND_MARKUP_BOOK)
 
 EXPORT_TITLES = {"m4b": "Экспорт m4b", "mp3": "Экспорт mp3", "json": "Экспорт разметки"}
 
@@ -160,6 +162,7 @@ class JobQueue:
             KIND_BOOK: self._run_book,
             KIND_FOLDER: self._run_folder,
             KIND_EXPORT: self._run_export,
+            KIND_MARKUP_BOOK: self._run_markup_book,
         }
         try:
             result = handlers[job.kind](job)
@@ -186,26 +189,73 @@ class JobQueue:
             conn.commit()  # иначе прогресс не виден интерфейсу до конца задачи
         return report
 
-    def _run_markup(self, job: Job) -> dict[str, Any]:
-        params = job.params
-        with self.db.connect() as conn:
-            result = library.markup_chapter(
-                conn, job.target_id, client=self.client, base_url=self.base_url,
-                model=params.get("model") or library.DEFAULT_MODEL,
-                batch_chars=int(params.get("batch_chars") or library.DEFAULT_BATCH_CHARS),
-                force=bool(params.get("force")),
-                on_progress=self._progress(conn, job.id),
+    def _markup_one(self, conn, chapter_id: int, params: dict[str, Any], report) -> Any:
+        """Разметить главу и записать расход токенов."""
+        result = library.markup_chapter(
+            conn, chapter_id, client=self.client, base_url=self.base_url,
+            # Пусто — модель из настроек библиотеки.
+            model=params.get("model") or None,
+            batch_chars=int(params.get("batch_chars") or library.DEFAULT_BATCH_CHARS),
+            force=bool(params.get("force")),
+            on_progress=report,
+        )
+        if result.usage:
+            chapter = repo.get_chapter(conn, chapter_id)
+            repo.record_usage(
+                conn, "anthropic", "markup", chars=len(chapter.text),
+                input_tokens=result.usage.get("input_tokens", 0),
+                output_tokens=result.usage.get("output_tokens", 0),
+                book_id=chapter.book_id,
             )
-            if result.usage:
-                book = repo.get_book(conn, repo.get_chapter(conn, job.target_id).book_id)
-                repo.record_usage(
-                    conn, "anthropic", "markup",
-                    chars=len(repo.get_chapter(conn, job.target_id).text),
-                    input_tokens=result.usage.get("input_tokens", 0),
-                    output_tokens=result.usage.get("output_tokens", 0),
-                    book_id=book.id,
-                )
+        return result
+
+    def _run_markup(self, job: Job) -> dict[str, Any]:
+        with self.db.connect() as conn:
+            result = self._markup_one(conn, job.target_id, job.params, self._progress(conn, job.id))
         return {"ok": result.ok, "issues": len(result.issues)}
+
+    def _run_markup_book(self, job: Job) -> dict[str, Any]:
+        """Разметить главы книги подряд. Уже размеченные — только с ``force``."""
+        force = bool(job.params.get("force"))
+        with self.db.connect() as conn:
+            chapters = [
+                c.id for c in repo.list_chapters(conn, job.target_id)
+                if force or not repo.list_segments(conn, c.id)
+            ]
+            repo.update_job(conn, job.id, total=len(chapters), done=0, progress=0.0)
+
+        total = len(chapters)
+        done, failed, issues, cancelled = 0, [], 0, False
+        for chapter_id in chapters:
+            if self._cancelling(job.id) or self._stop.is_set():
+                cancelled = True
+                break
+            with self.db.connect() as conn:
+                def report(batch_done: int, batch_total: int, conn=conn) -> None:
+                    share = batch_done / batch_total if batch_total else 0.0
+                    repo.update_job(conn, job.id, done=done, total=total,
+                                    progress=min(1.0, (done + share) / max(total, 1)))
+                    conn.commit()
+
+                try:
+                    result = self._markup_one(conn, chapter_id, job.params, report)
+                    issues += len(result.issues)
+                except MarkupConfigError:
+                    # Нет ключа или модели — остальные главы упадут так же.
+                    # Останавливаемся сразу, а не собираем пятьдесят одинаковых отказов.
+                    raise
+                except Exception as exc:  # noqa: BLE001 — одна глава не валит книгу
+                    log.warning("глава %s не размечена: %s", chapter_id, exc)
+                    failed.append({"chapter_id": chapter_id, "error": str(exc)})
+            done += 1
+            with self.db.connect() as conn:
+                repo.update_job(conn, job.id, done=done, total=total,
+                                progress=min(1.0, done / max(total, 1)))
+        return {
+            "chapters": total, "done": done, "failed": failed, "issues": issues,
+            "cancelled": cancelled,
+            "error": f"глав с ошибкой: {len(failed)}" if failed else None,
+        }
 
     def _chapter(
         self, chapter_id: int, job: Job, parallelism: int, report: Any = None
@@ -340,6 +390,8 @@ def _default_title(conn: sqlite3.Connection, kind: str, target_id: int | None) -
             return f"Озвучка папки: {repo.get_folder(conn, target_id).name}"
         if kind == KIND_EXPORT and target_id:
             return f"Экспорт: {repo.get_book(conn, target_id).title}"
+        if kind == KIND_MARKUP_BOOK and target_id:
+            return f"Разметка книги: {repo.get_book(conn, target_id).title}"
     except repo.RepoError:
         pass
     return kind

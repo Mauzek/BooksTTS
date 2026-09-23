@@ -1,6 +1,6 @@
 // Каркас приложения: маршруты, боковая панель, импорт.
 
-import { get, importBook, notify, pickBookFiles, post } from './api.js';
+import { get, importBook, notify, pickBookFiles, post, tauri } from './api.js';
 import { LibraryTree } from './tree.js';
 import { applyTheme, currentTheme, nextTheme, themeIcon, themeTitle } from './theme.js';
 import { $, ask, el, emit, guard, icon, plural, toast } from './ui.js';
@@ -24,7 +24,7 @@ const routes = [
   [/^#\/chapter\/(\d+)\/edit$/, ([id]) => editorScreen.render(view, Number(id)), 'library'],
   [/^#\/chapter\/(\d+)$/, ([id]) => chapterScreen.render(view, Number(id)), 'library'],
   [/^#\/search\?q=(.*)$/, ([q]) => searchScreen.render(view, decodeURIComponent(q)), 'library'],
-  [/^#\/voices$/, () => voicesScreen.render(view), 'voices'],
+  [/^#\/voices(?:\?book=(\d+))?$/, ([book]) => voicesScreen.render(view, book ? Number(book) : null), 'voices'],
   [/^#\/settings$/, () => settingsScreen.render(view), 'settings'],
   [/^#\/jobs$/, () => jobsScreen.render(view), 'jobs'],
   [/^#\/stats$/, () => statsScreen.render(view), 'stats'],
@@ -174,6 +174,61 @@ async function watchJobs() {
   clearTimeout(jobsTimer);
   jobsTimer = setTimeout(watchJobs, delay);
 }
+
+// ---------- обновления ----------
+// Проверяет оболочка Tauri: она скачивает latest.json из GitHub Releases и
+// сверяет подпись. В браузере (режим разработки) обновлять нечего.
+
+const UPDATE_DELAY_MS = 5000;
+
+function showUpdate(update) {
+  const host = $('#update');
+  const status = el('div', { class: 'hint' }, `Версия ${update.version}, у вас ${update.current}`);
+  const button = el('button', { class: 'primary' }, icon('download'), 'Обновить');
+  button.onclick = async () => {
+    button.disabled = true;
+    status.textContent = 'Скачиваю…';
+    const unlisten = await tauri.event.listen('update-progress', (event) => {
+      const { downloaded, total } = event.payload;
+      status.textContent = total
+        ? `Скачано ${Math.round((downloaded / total) * 100)}%`
+        : `Скачано ${(downloaded / 1048576).toFixed(1).replace('.', ',')} МБ`;
+    });
+    try {
+      status.textContent = 'Устанавливаю — приложение перезапустится';
+      await tauri.core.invoke('install_update');
+    } catch (error) {
+      status.textContent = String(error);
+      button.disabled = false;
+    } finally {
+      unlisten();
+    }
+  };
+  host.replaceChildren(
+    el('div', { class: 'update-title' }, icon('refresh-cw'), 'Доступно обновление'),
+    status, button);
+  host.hidden = false;
+}
+
+async function checkForUpdates({ quiet = true } = {}) {
+  if (!tauri?.core?.invoke) {
+    if (!quiet) toast('Обновления проверяются только в установленном приложении');
+    return null;
+  }
+  try {
+    const update = await tauri.core.invoke('check_update');
+    if (update) showUpdate(update);
+    else if (!quiet) toast('Установлена последняя версия', 'ok');
+    return update;
+  } catch (error) {
+    // Нет сети или релизов ещё не было — при фоновой проверке это не повод шуметь.
+    if (!quiet) toast(String(error), 'error');
+    return null;
+  }
+}
+
+window.addEventListener('check-updates', () => checkForUpdates({ quiet: false }));
+setTimeout(() => checkForUpdates(), UPDATE_DELAY_MS);
 
 // ---------- тема ----------
 

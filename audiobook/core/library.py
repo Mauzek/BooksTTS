@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .. import paths
-from . import repo
+from . import repo, secrets
 from .markup import DEFAULT_BATCH_CHARS, DEFAULT_MODEL, MarkupResult, markup_text
 from .models import Book, Chapter, Segment
 from .parser import PARAGRAPH_SEP, chapter_text, load_book, paragraph_spans
@@ -76,33 +76,45 @@ def import_book(
 
     stored_path = ""
     cover_path = None
-    if copy_source:
-        paths.ensure_layout()
-        target = _unique_name(paths.books_dir(), source.name)
-        shutil.copy2(source, target)
-        stored_path = paths.relative(target)
-        if parsed.cover:
-            cover = _unique_name(paths.books_dir(), f"{target.stem}.cover.{parsed.cover_type or 'jpg'}")
-            cover.write_bytes(parsed.cover)
-            cover_path = paths.relative(cover)
+    created: list[Path] = []
+    try:
+        if copy_source:
+            paths.ensure_layout()
+            target = _unique_name(paths.books_dir(), source.name)
+            shutil.copy2(source, target)
+            created.append(target)
+            stored_path = paths.relative(target)
+            if parsed.cover:
+                cover = _unique_name(
+                    paths.books_dir(), f"{target.stem}.cover.{parsed.cover_type or 'jpg'}"
+                )
+                cover.write_bytes(parsed.cover)
+                created.append(cover)
+                cover_path = paths.relative(cover)
 
-    book = repo.create_book(
-        conn,
-        title=title or parsed.title,
-        author=parsed.author,
-        source_path=stored_path,
-        folder_id=folder_id,
-        cover_path=cover_path,
-    )
-    for chapter in parsed.chapters:
-        repo.create_chapter(
+        book = repo.create_book(
             conn,
-            book_id=book.id,
-            number=chapter.number,
-            title=chapter.title,
-            # Канонический нормализованный текст: по нему считаются смещения.
-            text=chapter_text(chapter.paragraphs),
+            title=title or parsed.title,
+            author=parsed.author,
+            source_path=stored_path,
+            folder_id=folder_id,
+            cover_path=cover_path,
         )
+        for chapter in parsed.chapters:
+            repo.create_chapter(
+                conn,
+                book_id=book.id,
+                number=chapter.number,
+                title=chapter.title,
+                # Канонический нормализованный текст: по нему считаются смещения.
+                text=chapter_text(chapter.paragraphs),
+            )
+    except Exception:
+        # Запись в базу откатится, а копия осталась бы без хозяина: следующий
+        # импорт того же файла получил бы суффикс «-2» рядом с мусором.
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
     return book
 
 
@@ -320,12 +332,35 @@ def _manual_paragraphs(chapter: Chapter, segments: Sequence[Segment]) -> set[int
     return manual
 
 
+MARKUP_MODEL_SETTING = "anthropic.model"
+MARKUP_URL_SETTING = "anthropic.base_url"
+
+
+def markup_connection(
+    conn: Conn,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Ключ, адрес и модель для разметки.
+
+    Ключ — из системного хранилища (или окружения), адрес и модель — из
+    настроек библиотеки. Без этого ключ, сохранённый на экране настроек, до
+    клиента не доходил бы: SDK сам смотрит только в переменные окружения.
+    """
+    return {
+        "api_key": api_key or secrets.get_key("anthropic") or None,
+        "base_url": base_url or repo.get_setting(conn, MARKUP_URL_SETTING, "") or None,
+        "model": model or repo.get_setting(conn, MARKUP_MODEL_SETTING, "") or DEFAULT_MODEL,
+    }
+
+
 def markup_chapter(
     conn: Conn,
     chapter_id: int,
     *,
     client: Any = None,
-    model: str = DEFAULT_MODEL,
+    model: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
     batch_chars: int = DEFAULT_BATCH_CHARS,
@@ -337,6 +372,7 @@ def markup_chapter(
     Ручные правки сохраняются: абзацы с ``is_manual`` не переразмечаются, их
     сегменты остаются на своих местах. ``force`` стирает и их тоже.
     """
+    connection = markup_connection(conn, api_key, base_url, model)
     chapter = repo.get_chapter(conn, chapter_id)
     book = repo.get_book(conn, chapter.book_id)
     existing = repo.list_segments(conn, chapter_id)
@@ -355,9 +391,9 @@ def markup_chapter(
     result = markup_text(
         chapter.text,
         client=client,
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
+        model=connection["model"],
+        api_key=connection["api_key"],
+        base_url=connection["base_url"],
         batch_chars=batch_chars,
         known=list(repo.book_speakers(conn, book.id)),
         book_title=book.title,

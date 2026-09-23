@@ -14,7 +14,10 @@ from typing import Any
 from . import repo
 from .models import NARRATOR
 
-__all__ = ["Finding", "check_chapter", "check_book", "RARE_SPEAKER_LINES", "LONG_NARRATOR_CHARS"]
+__all__ = [
+    "Finding", "check_chapter", "check_book", "book_readiness",
+    "RARE_SPEAKER_LINES", "LONG_NARRATOR_CHARS",
+]
 
 Conn = sqlite3.Connection
 
@@ -130,4 +133,51 @@ def check_book(conn: Conn, book_id: int) -> dict[int, list[Finding]]:
     return {
         chapter.id: check_chapter(conn, chapter.id)
         for chapter in repo.list_chapters(conn, book_id)
+    }
+
+
+def book_readiness(conn: Conn, book_id: int) -> dict[str, Any]:
+    """Можно ли озвучивать книгу, и если нет — что именно мешает.
+
+    Спрашивается до постановки в очередь: лучше показать список ролей без
+    голоса сразу, чем через минуту получить задачу, упавшую на каждой главе.
+    """
+    chapters = repo.list_chapters(conn, book_id)
+    stats = repo.chapter_stats(conn, book_id)
+    speakers = repo.book_speakers(conn, book_id)
+    cast = repo.cast_map(conn, book_id)
+
+    unmarked = [
+        {"id": c.id, "number": c.number, "label": c.label}
+        for c in chapters if not stats.get(c.id, {}).get("segments")
+    ]
+    missing_voice = [
+        {"speaker": speaker, "lines": lines}
+        for speaker, lines in speakers.items()
+        if speaker not in cast or cast[speaker].voice_id is None
+    ]
+    # Голос назначен, но пропал из каталога движка — озвучить им нельзя.
+    unavailable = [
+        {"speaker": speaker, "voice": entry.voice.label, "engine": entry.voice.engine}
+        for speaker, entry in cast.items()
+        if speaker in speakers and entry.voice is not None and not entry.voice.available
+    ]
+    rare = [
+        {"speaker": speaker, "lines": lines}
+        for speaker, lines in speakers.items()
+        if speaker != NARRATOR and lines <= RARE_SPEAKER_LINES
+    ]
+    marked = len(chapters) - len(unmarked)
+    voiced = sum(1 for c in chapters if c.audio_path)
+    return {
+        "chapters": len(chapters),
+        "marked": marked,
+        "voiced": voiced,
+        "unmarked": unmarked,
+        "missing_voice": missing_voice,
+        "unavailable_voice": unavailable,
+        "rare_speakers": rare,
+        "errors": sum(s.get("errors", 0) for s in stats.values()),
+        # Главы без разметки озвучка просто пропустит — это не повод не начинать.
+        "ready": marked > 0 and not missing_voice and not unavailable,
     }

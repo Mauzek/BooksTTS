@@ -1,200 +1,297 @@
-"""Qwen3-TTS через локальный Gradio.
+"""Qwen3-TTS: локальный синтез на видеокарте.
 
-Сервер поднимает пользователь сам (``qwen-tts-demo …``), поэтому набор голосов
-и имена эндпоинтов спрашиваем у самого сервера через ``/gradio_api/info``, а не
-зашиваем в код. Встроенные голоса моделей CustomVoice (сверено 18.09.2026 по
-README проекта) используются только как запасной список, если сервер про свои
-варианты не рассказал.
+Модель живёт в отдельном окружении Python (torch с CUDA, пакет qwen-tts) и
+работает в дочернем процессе — рабочем. Приложение запускает его само при
+первом синтезе, держит, пока открыто, и общается строками JSON через
+stdin/stdout. Никаких портов и ручного запуска сервера.
+
+Голоса — девять встроенных голосов модели CustomVoice. По карточке модели
+(сверено 23.09.2026) все они говорят на всех десяти языках модели, включая
+русский, хотя у каждого есть «родной». Эмоция реплики передаётся модели как
+инструкция к интонации.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import threading
+import uuid
+from collections import deque
+from pathlib import Path
 from typing import Any
 
-from . import EngineError, VoiceInfo
+from . import EngineError, EngineFatalError, VoiceInfo
 
 NAME = "qwen"
-TITLE = "Qwen3-TTS (локальный сервер)"
+TITLE = "Qwen3-TTS (видеокарта)"
 
-DEFAULT_URL = "http://127.0.0.1:7860"
-TIMEOUT = 180.0  # синтез длинной реплики
-# Опрос доступности не должен держать экран голосов: сервера может не быть.
-INFO_TIMEOUT = 5.0
+DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+LANGUAGE = "Russian"
+# Первый запуск скачивает модель (несколько гигабайт) — ждём долго.
+READY_TIMEOUT = 1800.0
+REQUEST_TIMEOUT = 600.0  # пачка из восьми длинных реплик на слабой карте
+# Замерено на RTX 3070, модель 1.7B: пачка по 8 — 0,78× реального времени
+# при 5,1 ГБ видеопамяти; по одной — 0,15×.
+DEFAULT_BATCH = 8
 
-# Запасной список: девять предустановленных голосов CustomVoice.
-FALLBACK_VOICES = [
-    ("Vivian", "ж", "zh"), ("Serena", "ж", "zh"), ("Uncle_Fu", "м", "zh"),
-    ("Dylan", "м", "zh"), ("Eric", "м", "zh"), ("Ryan", "м", "en"),
-    ("Aiden", "м", "en"), ("Ono_Anna", "ж", "ja"), ("Sohee", "ж", "ko"),
+# Встроенные голоса CustomVoice: ключ, пол, родной язык.
+VOICES = [
+    ("Ryan", "м", "en", "энергичный, ритмичный"),
+    ("Aiden", "м", "en", "солнечный, американский"),
+    ("Uncle_Fu", "м", "zh", "зрелый, низкий и мягкий"),
+    ("Dylan", "м", "zh", "молодой, пекинский"),
+    ("Eric", "м", "zh", "живой, чэндуский"),
+    ("Vivian", "ж", "zh", "яркая, с характером"),
+    ("Serena", "ж", "zh", "тёплая, мягкая"),
+    ("Ono_Anna", "ж", "ja", "игривая"),
+    ("Sohee", "ж", "ko", "тёплая"),
 ]
-# Русский у Qwen3-TTS поддержан наравне с остальными девятью языками.
-LANGUAGES = ("zh", "en", "ru", "de", "fr", "ja", "ko", "pt", "es", "it")
 
-_VOICE_HINTS = ("voice", "speaker", "spk", "голос")
-_TTS_HINTS = ("tts", "generate", "synth", "speech", "predict")
+# Эмоция из разметки -> инструкция к интонации.
+INSTRUCTIONS = {
+    "радостно": "Говори радостно, с улыбкой в голосе",
+    "зло": "Говори зло, раздражённо и резко",
+    "грустно": "Говори грустно, тихо и устало",
+}
+
+# Подчёркивание в имени — чтобы поиск движков не импортировал рабочий скрипт.
+WORKER = Path(__file__).with_name("_qwen_worker.py")
+# Эмоция меняет звук: для этого движка она входит в отпечаток реплики.
+USES_EMOTION = True
+
+
+def default_home() -> Path:
+    """Папка Qwen по умолчанию: вне проекта и вне OneDrive."""
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(base) / "BookTTS-qwen"
+
+
+def python_in(home: Path) -> Path:
+    scripts = "Scripts" if sys.platform == "win32" else "bin"
+    exe = "python.exe" if sys.platform == "win32" else "python"
+    return home / "venv" / scripts / exe
+
+
+def default_python() -> Path:
+    return python_in(default_home())
+
+
+class _Worker:
+    """Дочерний процесс с загруженной моделью. Один на процесс приложения."""
+
+    def __init__(self, python: Path, worker: Path, model: str,
+                 hf_home: Path | None = None) -> None:
+        self.python, self.worker, self.model = python, worker, model
+        self.hf_home = hf_home
+        self.process: subprocess.Popen | None = None
+        self.device = ""
+        self.lock = threading.Lock()
+        self.errors: deque[str] = deque(maxlen=40)
+        self.next_id = 0
+
+    def alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def _drain_stderr(self, stream) -> None:
+        for line in stream:
+            self.errors.append(line.rstrip())
+
+    def _read(self, timeout: float) -> dict[str, Any]:
+        """Строка ответа от рабочего с ограничением по времени."""
+        result: dict[str, Any] = {}
+
+        def read() -> None:
+            line = self.process.stdout.readline()
+            if line:
+                try:
+                    result.update(json.loads(line))
+                except ValueError:
+                    result["error"] = f"непонятный ответ рабочего процесса: {line[:200]}"
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        reader.join(timeout)
+        if reader.is_alive():
+            self.stop()
+            raise EngineError("Qwen3-TTS не ответил вовремя — процесс перезапустится")
+        if not result:
+            tail = "\n".join(list(self.errors)[-5:])
+            self.stop()
+            raise EngineError(f"процесс Qwen3-TTS завершился{': ' + tail if tail else ''}")
+        return result
+
+    def start(self) -> None:
+        if self.alive():
+            return
+        flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+        environment = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        if self.hf_home is not None:
+            # Модель лежит рядом с окружением — например, вынесена на другой диск.
+            environment["HF_HOME"] = str(self.hf_home)
+        try:
+            self.process = subprocess.Popen(
+                [str(self.python), str(self.worker), self.model],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", bufsize=1, creationflags=flags, env=environment,
+            )
+        except OSError as exc:
+            raise EngineFatalError(f"не удалось запустить Qwen3-TTS: {exc}") from exc
+        threading.Thread(target=self._drain_stderr, args=(self.process.stderr,), daemon=True).start()
+        hello = self._read(READY_TIMEOUT)
+        if not hello.get("ready"):
+            self.stop()
+            raise EngineFatalError(f"модель Qwen3-TTS не загрузилась: {hello.get('error', 'без причины')}")
+        self.device = hello.get("device", "")
+
+    def request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            self.start()
+            self.next_id += 1
+            payload = {**payload, "id": self.next_id}
+            try:
+                self.process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                self.process.stdin.flush()
+            except OSError as exc:
+                self.stop()
+                raise EngineError(f"связь с Qwen3-TTS потеряна: {exc}") from exc
+            return self._read(REQUEST_TIMEOUT)
+
+    def stop(self) -> None:
+        if self.process is None:
+            return
+        try:
+            self.process.stdin.close()  # рабочий сам выходит, когда закрыт stdin
+            self.process.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            self.process.kill()
+        self.process = None
+
+
+# Модель занимает гигабайты видеопамяти — один рабочий на процесс приложения.
+_WORKERS: dict[tuple[str, str, str, str], _Worker] = {}
+_WORKERS_LOCK = threading.Lock()
 
 
 class QwenEngine:
     name = NAME
     title = TITLE
+    uses_emotion = True  # эмоция меняет звук — входит в отпечаток реплики
 
     def __init__(self, options: dict[str, Any] | None = None) -> None:
         options = options or {}
-        self.url = str(options.get("engine.qwen.url") or DEFAULT_URL).rstrip("/")
-        self.api_name = options.get("engine.qwen.api_name") or ""
-        self._transport = options.get("engine.qwen.transport")  # подмена в тестах
-
-    # -- связь -----------------------------------------------------------
-
-    def _request(self, method: str, path: str, timeout: float = TIMEOUT, **kwargs) -> Any:
-        if self._transport is not None:
-            return self._transport(method, path, **kwargs)
+        # Папка Qwen: окружение (venv) и, если есть, кеш модели (huggingface).
+        # Целиком переносится на другой диск — достаточно поменять настройку.
+        self.home = Path(options.get("engine.qwen.home") or default_home()).expanduser()
+        self.python = Path(options.get("engine.qwen.python") or python_in(self.home))
+        hf_home = self.home / "huggingface"
+        # Своей папки с моделью нет — общий кеш Hugging Face, как раньше:
+        # иначе у тех, кто ничего не переносил, модель скачалась бы заново.
+        self.hf_home = hf_home if hf_home.is_dir() else None
+        self.model = options.get("engine.qwen.model") or DEFAULT_MODEL
+        self.worker_script = Path(options.get("engine.qwen.worker") or WORKER)
         try:
-            import httpx
-        except ImportError as exc:  # pragma: no cover
-            raise EngineError("нужен httpx: pip install -r requirements.txt") from exc
-        try:
-            return httpx.request(method, f"{self.url}{path}", timeout=timeout, **kwargs)
-        except Exception as exc:  # noqa: BLE001 — сеть
-            raise EngineError(
-                f"сервер Qwen3-TTS не отвечает на {self.url} — запущен ли он?"
-            ) from exc
+            self.batch_size = max(1, int(options.get("engine.qwen.batch") or DEFAULT_BATCH))
+        except (TypeError, ValueError):
+            self.batch_size = DEFAULT_BATCH
 
-    def _info(self) -> dict[str, Any]:
-        last: Exception | None = None
-        for path in ("/gradio_api/info", "/info"):
-            try:
-                response = self._request("GET", path, timeout=INFO_TIMEOUT)
-            except EngineError as exc:
-                last = exc
-                continue
-            if getattr(response, "status_code", 500) < 400:
-                try:
-                    return response.json()
-                except Exception:  # noqa: BLE001 — не тот сервер
-                    continue
-        if last is not None:
-            raise last
-        raise EngineError(f"по адресу {self.url} не видно Gradio-интерфейса")
+    # -- окружение -------------------------------------------------------
 
-    @staticmethod
-    def _endpoints(info: dict[str, Any]) -> dict[str, Any]:
-        named = (info.get("named_endpoints") or {}) if isinstance(info, dict) else {}
-        return {name: spec for name, spec in named.items() if isinstance(spec, dict)}
+    def installed(self) -> bool:
+        return self.python.is_file()
 
-    def _pick_endpoint(self, info: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        endpoints = self._endpoints(info)
-        if not endpoints:
-            raise EngineError("у сервера нет ни одного API-эндпоинта")
-        if self.api_name:
-            spec = endpoints.get(self.api_name)
-            if spec is None:
-                raise EngineError(
-                    f"на сервере нет эндпоинта {self.api_name!r}; есть: {', '.join(endpoints)}"
-                )
-            return self.api_name, spec
-        for name, spec in endpoints.items():
-            if any(hint in name.lower() for hint in _TTS_HINTS):
-                return name, spec
-        name = next(iter(endpoints))
-        return name, endpoints[name]
+    def _worker(self) -> _Worker:
+        if not self.installed():
+            raise EngineFatalError(
+                "Qwen3-TTS не установлен: нет окружения "
+                f"{self.python} — установите его на экране «Голоса»"
+            )
+        key = self._key()
+        with _WORKERS_LOCK:
+            if key not in _WORKERS:
+                _WORKERS[key] = _Worker(self.python, self.worker_script, self.model, self.hf_home)
+            return _WORKERS[key]
 
-    @staticmethod
-    def _choices(spec: dict[str, Any]) -> list[str]:
-        """Варианты выпадающего списка голосов из описания эндпоинта."""
-        for parameter in spec.get("parameters", []) or []:
-            label = f"{parameter.get('label', '')} {parameter.get('parameter_name', '')}".lower()
-            if not any(hint in label for hint in _VOICE_HINTS):
-                continue
-            enum = ((parameter.get("type") or {}).get("enum")
-                    or (parameter.get("python_type") or {}).get("enum")
-                    or parameter.get("choices"))
-            if enum:
-                return [str(v) for v in enum]
-        return []
+    def _key(self) -> tuple[str, str, str, str]:
+        return (str(self.python), str(self.worker_script), self.model, str(self.hf_home or ""))
 
     # -- каталог ---------------------------------------------------------
 
     def list_voices(self) -> list[VoiceInfo]:
-        """Голоса запущенного сервера.
-
-        Если сервера нет — это ошибка, а не пустой список: положить в каталог
-        встроенные имена значило бы предложить голоса, которыми не озвучить.
-        """
-        info = self._info()  # сервер недоступен -> EngineError наверх
-        name, spec = self._pick_endpoint(info)
-        choices = self._choices(spec)
-        if choices:
-            return [VoiceInfo(key=v, name=v, language="", tags=[name] if name else [])
-                    for v in choices]
-        # Сервер отвечает, но про свои голоса не рассказал — берём встроенные.
+        if not self.installed():
+            raise EngineError("Qwen3-TTS не установлен")
         return [
-            VoiceInfo(key=key, name=key, gender=gender, language=language, tags=["встроенный"])
-            for key, gender, language in FALLBACK_VOICES
+            VoiceInfo(key=key, name=key.replace("_", " "), gender=gender, language="ru",
+                      tags=[f"родной: {native}", note])
+            for key, gender, native, note in VOICES
         ]
 
     def supports_language(self, language: str) -> bool:
-        return (language or "ru").lower()[:2] in LANGUAGES
+        return (language or "ru").lower()[:2] in {"ru", "en", "zh", "ja", "ko", "de", "fr", "pt", "es", "it"}
 
     def status(self) -> dict[str, Any]:
-        base = {"name": self.name, "title": self.title, "needs_key": False, "variant": self.url}
-        try:
-            info = self._info()
-            name, _spec = self._pick_endpoint(info)
-        except EngineError as exc:
-            return {**base, "ready": False, "detail": str(exc)}
-        return {**base, "ready": True, "detail": f"{self.url}, эндпоинт {name}"}
+        base = {"name": self.name, "title": self.title, "needs_key": False, "variant": self.model}
+        if not self.installed():
+            return {**base, "ready": False, "installed": False,
+                    "detail": f"не найден в {self.home}: нужно окружение с CUDA и модель (~9 ГБ)"}
+        worker = _WORKERS.get(self._key())
+        if worker and worker.alive():
+            detail = f"модель загружена, {worker.device}"
+        else:
+            detail = "установлен; модель загрузится при первом синтезе (до минуты)"
+        return {**base, "ready": True, "installed": True, "detail": detail}
 
     # -- синтез ----------------------------------------------------------
 
     def synthesize(
         self, text: str, voice_key: str, *, rate: float = 1.0,
-        pitch: float = 1.0, volume: float = 1.0,
+        pitch: float = 1.0, volume: float = 1.0, emotion: str = "",
     ) -> tuple[bytes, str]:
-        text = (text or "").strip()
-        if not text:
-            raise EngineError("пустой текст реплики")
-        name, _spec = self._pick_endpoint(self._info())
-        started = self._request("POST", f"/gradio_api/call{name}", json={"data": [text, voice_key]})
+        return self.synthesize_batch([{"text": text, "voice_key": voice_key, "emotion": emotion}])[0]
+
+    def synthesize_batch(self, items: list[dict[str, Any]]) -> list[tuple[bytes, str]]:
+        """Озвучить несколько реплик одним вызовом модели.
+
+        Пачка из восьми идёт в пять раз быстрее, чем восемь по одной, — ради
+        этого Qwen и пригоден для книг. Ошибка пачки — ошибка всех её реплик:
+        озвучка главы тогда повторит их по одной.
+        """
+        known = {key for key, *_ in VOICES}
+        for item in items:
+            if not (item.get("text") or "").strip():
+                raise EngineError("пустой текст реплики")
+            if item["voice_key"] not in known:
+                raise EngineFatalError(f"у Qwen3-TTS нет голоса {item['voice_key']!r}")
+
+        from ... import paths
+
+        scratch = paths.cache_dir() / "qwen"
+        scratch.mkdir(parents=True, exist_ok=True)
+        targets = [scratch / f"{uuid.uuid4().hex}.wav" for _ in items]
+        answer = self._worker().request({"items": [
+            {"text": item["text"].strip(), "speaker": item["voice_key"], "language": LANGUAGE,
+             "instruct": INSTRUCTIONS.get(item.get("emotion", ""), ""), "out": str(target)}
+            for item, target in zip(items, targets)
+        ]})
         try:
-            event_id = started.json().get("event_id")
-        except Exception as exc:  # noqa: BLE001
-            raise EngineError("сервер Qwen3-TTS ответил не тем, чего ждали") from exc
-        if not event_id:
-            raise EngineError("сервер Qwen3-TTS не выдал идентификатор задачи")
-
-        result = self._request("GET", f"/gradio_api/call{name}/{event_id}")
-        path = _audio_path(getattr(result, "text", "") or "")
-        if not path:
-            raise EngineError("сервер Qwen3-TTS не вернул аудио")
-        downloaded = self._request("GET", f"/gradio_api/file={path}")
-        data = getattr(downloaded, "content", b"")
-        if not data:
-            raise EngineError("файл с озвучкой пуст")
-        return data, "wav" if path.lower().endswith(".wav") else "mp3"
-
-
-def _audio_path(stream: str) -> str:
-    """Вытащить путь к файлу из потока событий Gradio."""
-    import json
-    import re
-
-    for line in stream.splitlines():
-        if not line.startswith("data:"):
-            continue
-        try:
-            payload = json.loads(line[5:].strip())
-        except ValueError:
-            continue
-        for item in payload if isinstance(payload, list) else [payload]:
-            if isinstance(item, dict):
-                candidate = item.get("path") or item.get("name") or item.get("url")
-                if candidate:
-                    return str(candidate)
-            if isinstance(item, str) and re.search(r"\.(wav|mp3|flac|ogg)$", item, re.I):
-                return item
-    return ""
+            if not answer.get("ok"):
+                raise EngineError(f"Qwen3-TTS: {answer.get('error', 'без причины')}")
+            return [(target.read_bytes(), "wav") for target in targets]
+        finally:
+            for target in targets:
+                target.unlink(missing_ok=True)
 
 
 def engine(options: dict[str, Any] | None = None) -> QwenEngine:
     return QwenEngine(options)
+
+
+def shutdown() -> None:
+    """Остановить рабочие процессы — при выходе из приложения."""
+    with _WORKERS_LOCK:
+        workers = list(_WORKERS.values())
+        _WORKERS.clear()
+    for worker in workers:
+        worker.stop()

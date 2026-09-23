@@ -94,7 +94,7 @@ def create_app(
         folder_id: int | None = None
 
     class MarkupRequest(BaseModel):
-        model: str = DEFAULT_MODEL
+        model: str = ""  # пусто — модель из настроек
         batch_chars: int = Field(default=3000, ge=500, le=20000)
         force: bool = False
 
@@ -296,22 +296,27 @@ def create_app(
     def config():
         models: list[str] = []
         error = ""
+        with app.state.db.connect() as conn:
+            connection = library.markup_connection(conn, base_url=app.state.base_url)
         try:
             import anthropic
 
-            options = {"base_url": app.state.base_url} if app.state.base_url else {}
+            options = {k: v for k, v in connection.items() if k != "model" and v}
             probe = app.state.client or anthropic.Anthropic(**options)
             models = [m.id for m in probe.models.list()]
         except Exception as exc:  # noqa: BLE001 — список моделей не критичен
             error = str(exc)[:200]
+        from .. import __version__
+
         return {
-            "default_model": DEFAULT_MODEL,
+            "version": __version__,
+            "default_model": connection["model"],
             "models": models,
             "models_error": error,
             "emotions": list(EMOTIONS),
             "narrator": NARRATOR,
             "library": str(paths.library_root()),
-            "endpoint": app.state.base_url
+            "endpoint": connection["base_url"]
             or os.environ.get("ANTHROPIC_BASE_URL")
             or "api.anthropic.com",
         }
@@ -781,6 +786,36 @@ def create_app(
                 "announce": [job.to_dict() for job in repo.unnotified_jobs(conn)],
             }
 
+    @app.get("/api/jobs/{job_id}")
+    def get_job(job_id: int):
+        """Одна задача — чтобы экран следил за своей, не читая всю очередь."""
+        with app.state.db.connect() as conn:
+            return repo.get_job(conn, job_id).to_dict()
+
+    @app.post("/api/books/{book_id}/markup")
+    def markup_book(book_id: int, request: MarkupRequest):
+        """Разметить книгу целиком: все главы без разметки, по очереди."""
+        with app.state.db.connect() as conn:
+            repo.get_book(conn, book_id)
+        job = app.state.queue.enqueue(
+            jobs.KIND_MARKUP_BOOK, book_id,
+            params={"model": request.model, "batch_chars": request.batch_chars,
+                    "force": request.force},
+        )
+        return job.to_dict()
+
+    @app.get("/api/books/{book_id}/readiness")
+    def book_readiness(book_id: int):
+        with app.state.db.connect() as conn:
+            repo.get_book(conn, book_id)
+            return checks_mod.book_readiness(conn, book_id)
+
+    @app.get("/api/continue")
+    def continue_listening(limit: int = 6):
+        """Что слушали последним — для главной страницы."""
+        with app.state.db.connect() as conn:
+            return {"items": repo.recent_playback(conn, limit=max(1, min(limit, 24)))}
+
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel_job(job_id: int):
         return app.state.queue.cancel(job_id).to_dict()
@@ -1019,3 +1054,8 @@ def serve(
         server.run(sockets=[sock])
     finally:
         app.state.queue.stop()
+        # Рабочий Qwen держит модель в видеопамяти — отпускаем её сразу, а не
+        # когда он сам заметит закрытый stdin.
+        from ..core.engines import qwen as qwen_engine
+
+        qwen_engine.shutdown()

@@ -150,6 +150,21 @@ def test_pronunciation_change_revoices_only_affected_lines(conn, voiced, engine)
     assert engine.calls == []
 
 
+def test_emotion_counts_only_for_engines_that_hear_it(conn, voiced, engine):
+    """Смена эмоции переозвучивает реплику у Qwen, но не у Silero — ему всё равно."""
+    synth.synthesize_chapter(conn, voiced.id)
+    target = repo.list_segments(conn, voiced.id)[1]
+    repo.update_segment(conn, target.id, emotion="зло")
+    assert synth.plan(conn, voiced.id)["pending"] == []  # у всех ролей Silero
+
+    qwen = repo.upsert_voice(conn, Voice(engine="qwen", voice_key="Ryan", display_name="Ryan"))
+    repo.set_cast(conn, voiced.book_id, target.speaker, qwen.id)
+    before = {p[0].id: p[3] for p in synth.plan(conn, voiced.id)["pending"]}
+    repo.update_segment(conn, target.id, emotion="радостно")
+    after = {p[0].id: p[3] for p in synth.plan(conn, voiced.id)["pending"]}
+    assert before[target.id] != after[target.id]
+
+
 def test_changing_the_voice_revoices_the_whole_role(conn, voiced, engine):
     synth.synthesize_chapter(conn, voiced.id)
     other = repo.upsert_voice(conn, Voice(engine="silero", voice_key="baya", display_name="baya"))

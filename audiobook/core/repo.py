@@ -23,7 +23,7 @@ __all__ = [
     "shift_chapter_numbers", "move_segments", "reset_chapter_derivatives", "book_summaries",
     "get_setting", "set_setting", "all_settings",
     "fts_query", "search",
-    "get_playback", "set_playback",
+    "get_playback", "set_playback", "recent_playback",
     "get_queue", "set_queue",
     "list_pronunciations", "set_pronunciation", "delete_pronunciation",
     "list_profiles", "get_profile", "save_profile", "delete_profile",
@@ -812,6 +812,44 @@ def set_playback(conn: Conn, book_id: int, chapter_id: int | None, position_ms: 
         "position_ms = excluded.position_ms, updated_at = excluded.updated_at",
         (book_id, chapter_id, max(0, int(position_ms))),
     )
+
+
+def recent_playback(conn: Conn, limit: int = 6) -> list[dict[str, Any]]:
+    """Книги, которые слушали последними, с долей прослушанного.
+
+    Доля считается по длительности: главы до текущей плюс позиция в ней,
+    делённые на всё озвученное в книге.
+    """
+    rows = conn.execute(
+        "SELECT p.book_id, p.chapter_id, p.position_ms, p.updated_at, "
+        "b.title, b.author, b.cover_path, c.number, c.title AS chapter_title, "
+        "c.duration_ms AS chapter_ms "
+        "FROM playback p JOIN book b ON b.id = p.book_id "
+        "LEFT JOIN chapter c ON c.id = p.chapter_id "
+        "ORDER BY p.updated_at DESC, p.book_id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    out = []
+    for row in rows:
+        totals = conn.execute(
+            "SELECT COALESCE(SUM(duration_ms), 0) AS total, "
+            "COALESCE(SUM(CASE WHEN number < ? THEN duration_ms ELSE 0 END), 0) AS before "
+            "FROM chapter WHERE book_id = ? AND audio_path IS NOT NULL",
+            (row["number"] or 0, row["book_id"]),
+        ).fetchone()
+        total = totals["total"] or 0
+        listened = (totals["before"] or 0) + (row["position_ms"] or 0)
+        label = f"Глава {row['number']}" + (f". {row['chapter_title']}" if row["chapter_title"] else "")
+        out.append({
+            "book_id": row["book_id"], "chapter_id": row["chapter_id"],
+            "title": row["title"], "author": row["author"], "cover_path": row["cover_path"],
+            "chapter_label": label if row["number"] is not None else "",
+            "position_ms": row["position_ms"] or 0, "chapter_ms": row["chapter_ms"] or 0,
+            "total_ms": total, "listened_ms": min(listened, total),
+            "progress": min(1.0, listened / total) if total else 0.0,
+            "updated_at": row["updated_at"],
+        })
+    return out
 
 
 def get_queue(conn: Conn) -> list[int]:
