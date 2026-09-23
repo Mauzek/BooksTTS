@@ -1,0 +1,14 @@
+.env
+audio/
+cache/
+*.roles.json
+*.roles.json.tmp
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# десктоп: артефакты Tauri (сам target/ уводится из OneDrive через CARGO_TARGET_DIR)
+desktop/src-tauri/target/
+desktop/src-tauri/gen/

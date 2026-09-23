@@ -1,0 +1,221 @@
+/* BookTTS — общий вид приложения. */
+
+/* Гамма: тёплый серый плюс оранжевый акцент.
+   Светлая тема — основная, тёмная включается системной настройкой или
+   выбором пользователя через data-theme на <html>. Цвета определены в одном
+   месте: тёмная тема переопределяет только сами оттенки. */
+:root {
+  color-scheme: light;
+  --bg: #f4f2ef; --panel: #ffffff; --sunken: #eae7e2; --ink: #1f1d1b; --muted: #6f6a64;
+  --line: #ddd8d1; --accent: #c25e13; --accent-ink: #ffffff;
+  --warn: #9b2226; --ok: #3f7d48; --amber: #8a5a00;
+
+  --hover: color-mix(in srgb, var(--accent) 8%, transparent);
+  --pick: color-mix(in srgb, var(--accent) 16%, transparent);
+  --radius: 8px; --sidebar: 300px; --player: 0px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #1a1918; --panel: #232120; --sunken: #141313; --ink: #ece8e3; --muted: #a29b93;
+    --line: #37322e; --accent: #f08a33; --accent-ink: #2a1503;
+    --warn: #e1705f; --ok: #6aa86f; --amber: #d1a03c;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #1a1918; --panel: #232120; --sunken: #141313; --ink: #ece8e3; --muted: #a29b93;
+  --line: #37322e; --accent: #f08a33; --accent-ink: #2a1503;
+  --warn: #e1705f; --ok: #6aa86f; --amber: #d1a03c;
+}
+
+* { box-sizing: border-box; }
+/* display у .player и других блоков иначе перебивает атрибут hidden. */
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.5 "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+}
+body.has-player { --player: 64px; }
+
+button, select, input, textarea {
+  font: inherit; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 7px; padding: 5px 10px;
+}
+button { cursor: pointer; white-space: nowrap; }
+button, a.button { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Иконки Lucide. Обводку и заливку задаём здесь: при ссылке на внешний
+   спрайт через <use> стили наследуются от места вставки, а не от файла. */
+.icon {
+  width: 16px; height: 16px; flex: none;
+  fill: none; stroke: currentColor; stroke-width: 1.8;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.icon.big { width: 20px; height: 20px; }
+.icon.huge { width: 44px; height: 44px; stroke-width: 1.2; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+button.danger { color: var(--warn); }
+button.ghost { background: transparent; border-color: transparent; }
+button.ghost:hover:not(:disabled) { background: var(--hover); border-color: transparent; }
+.icon-button { padding: 5px 8px; }
+input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: 1px; }
+kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; font: inherit; font-size: 11px; }
+mark { background: color-mix(in srgb, var(--amber) 35%, transparent); color: inherit; border-radius: 2px; padding: 0 1px; }
+.muted { color: var(--muted); }
+.grow { flex: 1; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.hint { color: var(--muted); font-size: 12px; line-height: 1.6; }
+
+/* ---------- каркас ---------- */
+
+.app {
+  display: grid; grid-template-columns: var(--sidebar) 1fr;
+  height: calc(100vh - var(--player));
+}
+.sidebar {
+  display: flex; flex-direction: column; min-height: 0;
+  background: var(--panel); border-right: 1px solid var(--line);
+}
+.brand { font-weight: 700; font-size: 15px; padding: 14px 16px 6px; }
+.nav { display: flex; flex-direction: column; padding: 4px 8px; gap: 1px; }
+.nav a {
+  color: inherit; text-decoration: none; padding: 6px 10px; border-radius: 7px;
+  display: flex; align-items: center; gap: 8px;
+}
+.nav a:hover { background: var(--hover); }
+.nav a.active { background: var(--pick); font-weight: 600; }
+.nav .badge { margin-left: auto; font-size: 11px; color: var(--muted); }
+.search { padding: 10px 12px 6px; }
+.search input { width: 100%; }
+.tree-head {
+  display: flex; align-items: center; gap: 4px; padding: 8px 12px 4px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted);
+}
+.tree-head button { font-size: 12px; text-transform: none; letter-spacing: 0; padding: 2px 8px; }
+.view { min-width: 0; min-height: 0; overflow: auto; }
+.page { max-width: 1100px; margin: 0 auto; padding: 22px 28px 60px; }
+.page h1 { font-size: 22px; margin: 0 0 4px; font-weight: 650; }
+.page h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .7px; color: var(--muted); margin: 26px 0 10px; }
+
+/* ---------- дерево библиотеки ---------- */
+
+.sidebar-foot { border-top: 1px solid var(--line); padding: 6px 10px; }
+.sidebar-foot button { width: 100%; justify-content: flex-start; color: var(--muted); }
+
+.tree { flex: 1; overflow: auto; padding: 2px 6px 16px; }
+.tree ul { list-style: none; margin: 0; padding: 0; }
+.tree ul ul { padding-left: 14px; }
+.node {
+  display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 6px;
+  cursor: pointer; user-select: none; border: 1px solid transparent; min-height: 28px;
+}
+.node:hover { background: var(--hover); }
+.node.active { background: var(--pick); }
+.node .twisty { width: 14px; text-align: center; color: var(--muted); font-size: 10px; flex: none; }
+.node .glyph { flex: none; width: 16px; text-align: center; }
+.node .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node .meta { font-size: 11px; color: var(--muted); flex: none; }
+.node input.rename { flex: 1; padding: 1px 6px; min-width: 0; }
+.node.drop-into { border-color: var(--accent); background: var(--pick); }
+.node.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.node.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+.tree .root-drop { min-height: 40px; border-radius: 6px; margin-top: 6px; }
+.tree .root-drop.drop-into { outline: 1px dashed var(--accent); }
+.tree .empty { padding: 10px; color: var(--muted); font-size: 13px; }
+
+/* ---------- карточки и списки ---------- */
+
+.book-head { display: flex; gap: 20px; align-items: flex-start; }
+.cover {
+  width: 120px; aspect-ratio: 2 / 3; flex: none; border-radius: 6px; object-fit: cover;
+  background: var(--sunken); border: 1px solid var(--line);
+  display: grid; place-items: center; color: var(--muted); font-size: 40px;
+}
+.editable { border-radius: 5px; padding: 0 4px; margin: 0 -4px; cursor: text; }
+.editable:hover { background: var(--hover); }
+.stats { display: flex; gap: 18px; flex-wrap: wrap; margin: 8px 0 14px; color: var(--muted); font-size: 13px; }
+.stats b { color: var(--ink); font-weight: 600; }
+
+.list { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); overflow: hidden; }
+.list-row {
+  display: grid; grid-template-columns: 44px 1fr auto; gap: 10px; align-items: center;
+  padding: 8px 12px; border-top: 1px solid var(--line);
+}
+.list-row:first-child { border-top: 0; }
+.list-row:hover { background: var(--hover); }
+.list-row .num { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
+.list-row .title { min-width: 0; }
+.list-row .title .sub { color: var(--muted); font-size: 12px; }
+.list-row .actions { display: flex; gap: 4px; opacity: 0; transition: opacity .12s; }
+.list-row:hover .actions, .list-row:focus-within .actions { opacity: 1; }
+
+.progress { height: 4px; border-radius: 2px; background: var(--sunken); overflow: hidden; width: 90px; }
+.progress > i { display: block; height: 100%; background: var(--ok); }
+
+/* границы глав */
+.paragraphs { margin: 6px 0 10px 54px; border-left: 2px solid var(--line); }
+.para {
+  position: relative; padding: 6px 12px 6px 14px; font: 14px/1.6 Georgia, ui-serif, serif;
+  color: var(--ink);
+}
+.para:hover { background: var(--hover); }
+.para .cut {
+  position: absolute; left: -12px; top: -9px; font: 11px/1 "Segoe UI", sans-serif; padding: 2px 8px;
+  border-radius: 10px; opacity: 0; background: var(--panel);
+}
+.para:hover .cut { opacity: 1; }
+.para:first-child .cut { display: none; }
+
+/* поиск */
+.result { padding: 10px 14px; border-top: 1px solid var(--line); cursor: pointer; }
+.result:first-child { border-top: 0; }
+.result:hover { background: var(--hover); }
+.result .kind { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+.result .snippet { font: 13px/1.6 Georgia, ui-serif, serif; color: var(--muted); margin-top: 2px; }
+
+.empty-state { text-align: center; padding: 70px 20px; color: var(--muted); }
+.empty-state .big { display: flex; justify-content: center; margin-bottom: 10px; color: var(--muted); }
+.placeholder { border: 1px dashed var(--line); border-radius: var(--radius); padding: 28px; color: var(--muted); }
+
+/* ---------- диалоги и уведомления ---------- */
+
+dialog {
+  border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--ink);
+  padding: 18px; min-width: 340px; max-width: min(560px, 92vw);
+}
+dialog::backdrop { background: rgba(0, 0, 0, .4); }
+dialog h3 { margin: 0 0 12px; font-size: 15px; }
+dialog .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+dialog .field input, dialog .field select { width: 100%; }
+dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+
+#toasts {
+  position: fixed; right: 16px; bottom: calc(var(--player) + 16px); display: flex;
+  flex-direction: column; gap: 8px; z-index: 50; pointer-events: none;
+}
+.toast {
+  pointer-events: auto; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  border-radius: 8px; padding: 9px 14px; box-shadow: 0 6px 20px rgba(0, 0, 0, .15); max-width: 420px;
+}
+.toast.error { border-left-color: var(--warn); }
+.toast.ok { border-left-color: var(--ok); }
+
+.drop-overlay {
+  position: fixed; inset: 0; display: grid; place-items: center; z-index: 40;
+  background: color-mix(in srgb, var(--accent) 12%, transparent); border: 3px dashed var(--accent);
+  font-size: 18px; font-weight: 600; pointer-events: none;
+}
+
+/* ---------- плеер (этап 5) ---------- */
+
+.player {
+  position: fixed; left: 0; right: 0; bottom: 0; height: var(--player);
+  background: var(--panel); border-top: 1px solid var(--line);
+  display: flex; align-items: center; gap: 12px; padding: 0 16px;
+}

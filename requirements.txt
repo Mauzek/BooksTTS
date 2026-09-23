@@ -1,0 +1,28 @@
+# --- разбор книг (core/parser.py, core/formats.py) ---
+EbookLib>=0.18
+beautifulsoup4>=4.12
+lxml>=5.0                 # желателен: fb2 без него разбирается менее терпимо к ошибкам
+pypdf>=6.0                # pdf; сканы без текстового слоя не читаются
+python-docx>=1.1          # docx
+
+# --- разметка по ролям (core/markup.py) ---
+anthropic>=1.0
+python-dotenv>=1.0
+tqdm>=4.66
+
+# --- бэкенд приложения (api/) ---
+fastapi>=0.110
+uvicorn>=0.27
+
+# --- голоса и синтез (core/voices.py, core/tts.py) ---
+PyYAML>=6.0
+torch>=2.2                # silero через torch.hub
+torchaudio>=2.2
+omegaconf>=2.3            # нужен самой silero, но в её зависимостях не объявлен
+
+# --- склейка (core/assemble.py) ---
+pydub>=0.25
+imageio-ffmpeg>=0.4       # даёт ffmpeg, если его нет в системе
+
+# --- опциональный облачный TTS ---
+# elevenlabs>=1.0

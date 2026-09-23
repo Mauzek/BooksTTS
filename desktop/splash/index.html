@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>BookTTS</title>
+<style>
+:root { color-scheme: light dark; --bg:#f4f2ef; --ink:#1f1d1b; --muted:#6f6a64; --line:#ddd8d1; --accent:#c25e13; --warn:#9b2226; }
+@media (prefers-color-scheme: dark) { :root { --bg:#1a1918; --ink:#ece8e3; --muted:#a29b93; --line:#37322e; --accent:#f08a33; } }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
+       display: grid; place-items: center; padding: 0 24px; }
+main { max-width: 760px; width: 100%; text-align: center; }
+h1 { font-size: 22px; font-weight: 650; margin: 0 0 8px; }
+p { color: var(--muted); margin: 0 0 18px; }
+.spin { width: 22px; height: 22px; margin: 0 auto 16px; border: 3px solid var(--line);
+        border-top-color: var(--accent); border-radius: 50%; animation: s 0.9s linear infinite; }
+@keyframes s { to { transform: rotate(360deg); } }
+pre { text-align: left; max-height: 50vh; overflow: auto; background: color-mix(in srgb, var(--ink) 6%, transparent);
+      border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 12px; white-space: pre-wrap; }
+button { font: inherit; padding: 6px 16px; border-radius: 7px; border: 1px solid var(--accent);
+         background: var(--accent); color: #fff; cursor: pointer; }
+.failed h1 { color: var(--warn); }
+.failed .spin { display: none; }
+</style>
+</head>
+<body>
+<main id="root">
+  <div class="spin"></div>
+  <h1 id="title">BookTTS</h1>
+  <p id="message">Запускаю бэкенд…</p>
+  <pre id="log" hidden></pre>
+  <button id="retry" hidden>Перезапустить</button>
+</main>
+<script>
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+const $ = (id) => document.getElementById(id);
+
+function show(status) {
+  const failed = status.state === 'failed';
+  $('root').classList.toggle('failed', failed);
+  $('title').textContent = failed ? 'Бэкенд не запустился' : 'BookTTS';
+  $('message').textContent = failed
+    ? 'Ниже — последние строки его вывода.'
+    : status.state === 'ready' ? 'Открываю библиотеку…' : 'Запускаю бэкенд…';
+  $('log').hidden = !failed;
+  $('log').textContent = failed ? status.message : '';
+  $('retry').hidden = !failed;
+}
+
+listen('backend-status', (event) => show(event.payload));
+invoke('backend_status').then(show);
+$('retry').onclick = () => { show({ state: 'starting' }); invoke('restart_backend'); };
+</script>
+</body>
+</html>

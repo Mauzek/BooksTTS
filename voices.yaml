@@ -1,0 +1,35 @@
+# Голоса персонажей. engine: silero | elevenlabs
+# Дикторы silero: aidar, baya, kseniya, xenia, eugene
+# rate — темп речи, 0.5–2.0
+narrator:
+  engine: silero
+  speaker: aidar
+  rate: 1.0
+Аглая:
+  engine: silero
+  speaker: xenia
+  rate: 1.0
+Велимир:
+  engine: silero
+  speaker: baya
+  rate: 1.0
+дед Терех:
+  engine: silero
+  speaker: kseniya
+  rate: 1.0
+Руди:
+  engine: silero
+  speaker: eugene
+  rate: 1.0
+Хитогами:
+  engine: silero
+  speaker: baya
+  rate: 1.0
+Сильфи:
+  engine: silero
+  speaker: xenia
+  rate: 1.0
+Рокси:
+  engine: silero
+  speaker: xenia
+  rate: 1.0

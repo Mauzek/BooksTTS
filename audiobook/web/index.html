@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BookTTS</title>
+<script>
+// До первой отрисовки, иначе окно мигнёт светлым перед тёмной темой.
+try {
+  var saved = localStorage.getItem('booktts-theme');
+  if (saved === 'light' || saved === 'dark') document.documentElement.setAttribute('data-theme', saved);
+} catch (e) { /* приватный режим */ }
+</script>
+<link rel="stylesheet" href="/ui/css/app.css">
+<link rel="stylesheet" href="/ui/css/screens.css">
+</head>
+<body>
+
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">BookTTS</div>
+    <nav class="nav" id="nav">
+      <a href="#/" data-route="library"><svg class="icon"><use href="/ui/icons.svg#library"></use></svg> Библиотека</a>
+      <a href="#/jobs" data-route="jobs"><svg class="icon"><use href="/ui/icons.svg#list-checks"></use></svg> Задачи<span class="badge" id="jobs-badge" hidden></span></a>
+      <a href="#/voices" data-route="voices"><svg class="icon"><use href="/ui/icons.svg#mic"></use></svg> Голоса</a>
+      <a href="#/stats" data-route="stats"><svg class="icon"><use href="/ui/icons.svg#chart-column"></use></svg> Статистика</a>
+      <a href="#/settings" data-route="settings"><svg class="icon"><use href="/ui/icons.svg#settings"></use></svg> Настройки</a>
+    </nav>
+    <div class="search">
+      <input id="search" type="search" placeholder="Поиск: названия и текст глав" autocomplete="off">
+    </div>
+    <div class="tree-head">
+      <span class="grow">Папки и книги</span>
+      <button id="new-folder" title="Новая папка">
+        <svg class="icon"><use href="/ui/icons.svg#folder-plus"></use></svg>папка
+      </button>
+      <button id="import" title="Добавить книги">
+        <svg class="icon"><use href="/ui/icons.svg#book-plus"></use></svg>книга
+      </button>
+    </div>
+    <div id="tree" class="tree"></div>
+    <div class="sidebar-foot">
+      <button id="theme" class="ghost" title="Тема оформления"></button>
+    </div>
+  </aside>
+  <main id="view" class="view"></main>
+</div>
+
+<footer id="player" class="player" hidden></footer>
+<div id="toasts" aria-live="polite"></div>
+
+<script>
+// Ошибки интерфейса — в лог бэкенда: в окне Tauri консоли разработчика не видно.
+// Обычный скрипт перед модулями, чтобы поймать и 404, и синтаксическую ошибку модуля.
+(function () {
+  function report(payload) {
+    try {
+      fetch('/api/client-log', {
+        method: 'POST', keepalive: true, body: JSON.stringify(payload),
+        headers: { 'content-type': 'application/json', 'x-requested-with': 'booktts' },
+      });
+    } catch (e) { /* лог — не повод падать */ }
+  }
+  window.addEventListener('error', function (event) {
+    var target = event.target || {};
+    report({
+      message: String(event.message || 'не загрузился ресурс'),
+      source: event.filename || target.src || target.href || '',
+      line: event.lineno || 0,
+      stack: (event.error && event.error.stack) || '',
+    });
+  }, true);
+  window.addEventListener('unhandledrejection', function (event) {
+    var reason = event.reason || {};
+    report({ message: String(reason.message || reason), source: 'promise', line: 0, stack: reason.stack || '' });
+  });
+})();
+</script>
+<script type="module" src="/ui/js/app.js"></script>
+</body>
+</html>
