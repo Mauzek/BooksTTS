@@ -1,6 +1,6 @@
 [package]
 name = "booktts"
-version = "0.3.0"
+version = "0.3.1"
 description = "BookTTS — многоголосые аудиокниги"
 edition = "2021"
 

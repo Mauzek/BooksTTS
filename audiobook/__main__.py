@@ -97,6 +97,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="завершиться, когда родитель закроет stdin",
     )
 
+    p_self = sub.add_parser("self-check", help="проверить, что сборка умеет озвучивать")
+    p_self.add_argument(
+        "--synth", action="store_true",
+        help="ещё и озвучить фразу через silero (первый раз скачает модель)",
+    )
+
     return parser
 
 
@@ -243,6 +249,17 @@ def cmd_serve(args, db: Database) -> int:
     return 0
 
 
+def cmd_self_check(args) -> int:
+    from .core import selfcheck
+
+    results = selfcheck.run(synth=args.synth)
+    for check in results:
+        print(f"  {'✔' if check.ok else '✖'} {check.name}: {check.detail}")
+    failed = [c for c in results if not c.ok]
+    print(f"\nНе прошло: {len(failed)}" if failed else "\nВсё в порядке.")
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _setup_console()
     _load_dotenv()
@@ -252,6 +269,10 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
+
+    if args.command == "self-check":
+        # Библиотека проверке не нужна — не трогаем её.
+        return cmd_self_check(args)
 
     if args.library:
         paths.set_library_root(args.library)

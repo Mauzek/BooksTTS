@@ -26,9 +26,9 @@ jobs:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: utf-8
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -44,8 +44,13 @@ jobs:
       - name: Сборка бэкенда
         run: python -m PyInstaller desktop/backend.spec --noconfirm --distpath desktop/backend-dist --workpath build/pyinstaller
 
-      - name: Бэкенд запускается
-        run: desktop/backend-dist/booktts-backend/booktts-backend.exe --version
+      # Запуска мало: 0.3.0 запускалась, но не озвучивала — в сборку не попал
+      # numpy. Здесь собранный exe сам проходит путь звука до mp3 и озвучивает
+      # фразу через silero.
+      - name: Бэкенд озвучивает
+        run: |
+          desktop/backend-dist/booktts-backend/booktts-backend.exe --version
+          desktop/backend-dist/booktts-backend/booktts-backend.exe self-check --synth
 
       - uses: dtolnay/rust-toolchain@stable
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import re
 import wave
+from array import array
 from typing import Any
 
 from . import EngineError, EngineFatalError, VoiceInfo
@@ -97,8 +98,22 @@ def wav_bytes(samples, sample_rate: int = SAMPLE_RATE) -> bytes:
         handle.setnchannels(1)
         handle.setsampwidth(2)
         handle.setframerate(sample_rate)
-        handle.writeframes(b"".join(int(s).to_bytes(2, "little", signed=True) for s in samples))
+        handle.writeframes(array("h", map(int, samples)).tobytes())
     return buffer.getvalue()
+
+
+def tensor_to_wav(audio, sample_rate: int = SAMPLE_RATE, volume: float = 1.0) -> bytes:
+    """Тензор float в [-1, 1] -> wav 16 бит.
+
+    Без numpy: torch 2.x не ставит его зависимостью, и в сборке из CI его не
+    оказалось — ``.numpy()`` падал на каждой реплике.
+    """
+    import torch
+
+    if abs(volume - 1.0) >= 1e-3:
+        audio = audio * float(volume)
+    samples = (audio.clamp(-1.0, 1.0) * 32767).to(torch.int16).cpu()
+    return wav_bytes(samples.tolist(), sample_rate)
 
 
 def _escape(text: str) -> str:
@@ -208,10 +223,7 @@ class SileroEngine:
             waves.append(audio)
 
         audio = torch.cat(waves) if len(waves) > 1 else waves[0]
-        if abs(volume - 1.0) >= 1e-3:
-            audio = audio * float(volume)
-        samples = (audio.clamp(-1.0, 1.0) * 32767).to(torch.int16).cpu().numpy()
-        return wav_bytes(samples.tolist(), self.sample_rate), "wav"
+        return tensor_to_wav(audio, self.sample_rate, volume), "wav"
 
 
 def engine(options: dict[str, Any] | None = None) -> SileroEngine:

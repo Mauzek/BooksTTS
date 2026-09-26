@@ -91,7 +91,8 @@ def test_broken_wav_is_skipped_not_fatal(tmp_path):
 
 
 def test_nothing_to_assemble_is_an_error(tmp_path):
-    with pytest.raises(AssembleError, match="ни одна реплика"):
+    # Причина — в сообщении: по одному «ни одна не озвучена» не понять, что чинить.
+    with pytest.raises(AssembleError, match="ни одна реплика не озвучена: упало"):
         assemble_chapter([Piece("Аглая", None, error="упало")], tmp_path / "out.wav")
 
 

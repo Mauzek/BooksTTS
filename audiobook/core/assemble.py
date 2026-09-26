@@ -184,7 +184,12 @@ def assemble_chapter(
         used += 1
 
     if track is None or not used:
-        raise AssembleError("нечего склеивать: ни одна реплика не озвучена")
+        # Причину первой неудачи — в сообщение: «нечего склеивать» само по себе
+        # не говорит, что чинить.
+        reason = next((p.error for p in skipped if p.error), "")
+        raise AssembleError(
+            "ни одна реплика не озвучена" + (f": {reason}" if reason else "")
+        )
 
     if normalize:
         track = effects.normalize(track, headroom=HEADROOM_DB)

@@ -116,8 +116,8 @@ powershell -File desktop\build.ps1   # установщик на этой маш
 `desktop/src-tauri/Cargo.toml` и `audiobook/__init__.py`, затем
 
 ```bash
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.3.1
+git push origin v0.3.1
 ```
 
 CI (`.github/workflows/release.yml`) прогонит тесты, соберёт установщик и

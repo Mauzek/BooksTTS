@@ -119,6 +119,26 @@ def test_unusable_device_is_refused_on_save(conn, monkeypatch):
     assert catalog.settings(conn)["engine.silero.device"] == "cpu"
 
 
+def test_silero_audio_does_not_need_numpy(monkeypatch):
+    """Сборка 0.3.0 без numpy падала на .numpy() в каждой реплике."""
+    import io
+    import wave
+
+    import torch
+
+    def no_numpy(self):
+        raise RuntimeError("Numpy is not available")
+
+    monkeypatch.setattr(torch.Tensor, "numpy", no_numpy)
+    audio = torch.tensor([0.0, 0.5, -0.5, 2.0])  # 2.0 — за пределами, срежется
+    data = silero_module.tensor_to_wav(audio, 24000, volume=0.5)
+    with wave.open(io.BytesIO(data), "rb") as handle:
+        assert handle.getframerate() == 24000
+        frames = handle.readframes(handle.getnframes())
+    samples = [int.from_bytes(frames[i:i + 2], "little", signed=True) for i in range(0, 8, 2)]
+    assert samples == [0, 8191, -8191, 32767]
+
+
 def test_silero_splits_long_text_by_sentences():
     parts = silero_module.split_for_tts("Раз. " * 400)
     assert len(parts) > 1
