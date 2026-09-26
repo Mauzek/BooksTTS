@@ -48,6 +48,14 @@ class Finding:
         }
 
 
+def _replicas(count: int) -> str:
+    """1 реплика, 2 реплики, 5 реплик."""
+    mod10, mod100 = count % 10, count % 100
+    word = "реплика" if mod10 == 1 and mod100 != 11 else (
+        "реплики" if 2 <= mod10 <= 4 and not 12 <= mod100 <= 14 else "реплик")
+    return f"{count} {word}"
+
+
 def _no_voice(conn: Conn, book_id: int, segments) -> list[Finding]:
     cast = repo.cast_map(conn, book_id)
     without: dict[str, list[int]] = {}
@@ -59,7 +67,7 @@ def _no_voice(conn: Conn, book_id: int, segments) -> list[Finding]:
         Finding(
             kind="no_voice",
             severity="blocker",
-            message=f"«{speaker}»: голос не назначен, {len(ids)} сегм.",
+            message=f"«{speaker}»: нет голоса — {_replicas(len(ids))} не озвучатся",
             segment_ids=ids,
             speaker=speaker,
         )
@@ -81,7 +89,7 @@ def _rare_speakers(conn: Conn, book_id: int, segments) -> list[Finding]:
                 kind="rare_speaker",
                 severity="warning",
                 message=(
-                    f"«{speaker}»: всего {total} реплик(и) на книгу — "
+                    f"«{speaker}»: {_replicas(total)} на всю книгу — "
                     "возможно, это не персонаж"
                 ),
                 segment_ids=ids,
@@ -181,3 +189,29 @@ def book_readiness(conn: Conn, book_id: int) -> dict[str, Any]:
         # Главы без разметки озвучка просто пропустит — это не повод не начинать.
         "ready": marked > 0 and not missing_voice and not unavailable,
     }
+
+
+def studio_overview(conn: Conn) -> list[dict[str, Any]]:
+    """Все книги с тем, что с ними сделано: для обзора студии.
+
+    На каждую книгу — её готовность (как перед озвучкой) и число ролей.
+    Книги, над которыми ещё работать, идут первыми, свежие — выше.
+    """
+    books = sorted(repo.book_summaries(conn).values(),
+                   key=lambda b: (b.get("created_at") or "", b["id"]), reverse=True)
+    out = []
+    for book in books:
+        state = book_readiness(conn, book["id"])
+        out.append({
+            **book,
+            "marked": state["marked"],
+            "voiced": state["voiced"],
+            "unmarked": state["unmarked"][:3],
+            "missing_voice": len(state["missing_voice"]),
+            "unavailable_voice": len(state["unavailable_voice"]),
+            "roles": len(repo.book_speakers(conn, book["id"])),
+            "errors": state["errors"],
+        })
+    done = [b for b in out if b["chapters"] and b["voiced"] >= b["chapters"]]
+    return [b for b in out if b not in done] + done
+

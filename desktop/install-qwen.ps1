@@ -1,9 +1,13 @@
 ﻿# Установка Qwen3-TTS: отдельное окружение с CUDA-сборкой torch и моделью.
 #
 # Нужны видеокарта NVIDIA (6 ГБ памяти или больше), Python 3.11 и около 10 ГБ
-# на диске. Окружение ставится в %LOCALAPPDATA%\BookTTS-qwen — там его ищет
-# приложение. Основное приложение с ним не смешивается: qwen-tts требует свою
-# версию transformers, а torch с CUDA весит гигабайты.
+# на диске. Окружение ставится рядом с установленным приложением (папка qwen),
+# там его ищет приложение; без установленного приложения — в
+# %LOCALAPPDATA%\BookTTS-qwen. Основное приложение с ним не смешивается:
+# qwen-tts требует свою версию transformers, а torch с CUDA весит гигабайты.
+#
+# Python из Microsoft Store не может писать в %LOCALAPPDATA% (Windows
+# перенаправляет запись) — с ним окружение должно лежать вне AppData.
 #
 #   powershell -ExecutionPolicy Bypass -File desktop\install-qwen.ps1
 #
@@ -13,10 +17,16 @@
 
 param(
     [string]$Model = 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice',
-    [string]$Root = (Join-Path $env:LOCALAPPDATA 'BookTTS-qwen')
+    [string]$Root = ''
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $Root) {
+    $installed = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BookTTS' -ErrorAction SilentlyContinue).InstallLocation
+    if ($installed) { $Root = Join-Path $installed.Trim('"') 'qwen' }
+    else { $Root = Join-Path $env:LOCALAPPDATA 'BookTTS-qwen' }
+}
+Write-Host "Папка Qwen: $Root"
 $root = $Root
 $python = Join-Path $root 'venv\Scripts\python.exe'
 New-Item -ItemType Directory -Force $root | Out-Null

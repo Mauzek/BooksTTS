@@ -280,7 +280,78 @@ ALTER TABLE voice ADD COLUMN tags TEXT NOT NULL DEFAULT '';
 ALTER TABLE voice ADD COLUMN updated_at TEXT;
 """
 
-MIGRATIONS: dict[int, str] = {2: MIGRATION_2, 3: MIGRATION_3}
+# Версия 4: правило произношения может действовать во всех книгах сразу
+# (book_id IS NULL) — «т. е.» → «то есть» незачем повторять в каждой книге.
+# SQLite не умеет снять NOT NULL — таблицу пересобираем.
+MIGRATION_4 = """
+CREATE TABLE pronunciation_new (
+    id             INTEGER PRIMARY KEY,
+    book_id        INTEGER REFERENCES book(id) ON DELETE CASCADE,  -- NULL: для всех книг
+    term           TEXT NOT NULL,
+    replacement    TEXT NOT NULL,
+    whole_word     INTEGER NOT NULL DEFAULT 1,
+    case_sensitive INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO pronunciation_new (id, book_id, term, replacement, whole_word, case_sensitive)
+    SELECT id, book_id, term, replacement, whole_word, case_sensitive FROM pronunciation;
+DROP TABLE pronunciation;
+ALTER TABLE pronunciation_new RENAME TO pronunciation;
+-- NULL в UNIQUE друг с другом не совпадают, поэтому уникальность — по выражению.
+CREATE UNIQUE INDEX pronunciation_scope_term ON pronunciation (COALESCE(book_id, 0), term);
+"""
+
+# Версия 5: сведения о книге — год, страна, описание, жанры, настроение и
+# свои метки; отметка «глава прослушана». Списки хранятся JSON-массивами: фильтруются они в интерфейсе,
+# а по жанру и настроению рисуется обложка.
+MIGRATION_5 = """
+ALTER TABLE book ADD COLUMN year INTEGER;
+ALTER TABLE book ADD COLUMN country TEXT NOT NULL DEFAULT '';
+ALTER TABLE book ADD COLUMN description TEXT NOT NULL DEFAULT '';
+ALTER TABLE book ADD COLUMN genres TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE book ADD COLUMN moods TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE book ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+
+-- Прослушанная глава помечается и остаётся прослушанной, даже если книгу
+-- начали слушать заново. Раньше это выводилось из текущей главы, поэтому
+-- главы до неё считаем уже прослушанными.
+ALTER TABLE chapter ADD COLUMN listened_at TEXT;
+UPDATE chapter SET listened_at = datetime('now')
+WHERE audio_path IS NOT NULL AND EXISTS (
+    SELECT 1 FROM playback p JOIN chapter current ON current.id = p.chapter_id
+    WHERE p.book_id = chapter.book_id AND chapter.number < current.number
+);
+-- Текущая глава, остановленная у самого конца, тоже дослушана.
+UPDATE chapter SET listened_at = datetime('now')
+WHERE listened_at IS NULL AND duration_ms IS NOT NULL AND EXISTS (
+    SELECT 1 FROM playback p
+    WHERE p.chapter_id = chapter.id
+      AND p.position_ms >= MAX(chapter.duration_ms - 10000, chapter.duration_ms * 0.9)
+);
+"""
+
+# Версия 6: откуда сведения о книге. «ai» — их подобрала нейросеть: книга
+# помечается, и подбор не предлагается снова, как будто его не было.
+MIGRATION_6 = """
+ALTER TABLE book ADD COLUMN info_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE book ADD COLUMN info_at TEXT;
+"""
+
+# Версия 7: цвет роли закреплён за ней. Раньше цвет выдавался по частоте
+# реплик и менялся, стоило поправить разметку; теперь он остаётся прежним,
+# а человек может выбрать свой.
+MIGRATION_7 = """
+CREATE TABLE role_color (
+    book_id  INTEGER NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+    speaker  TEXT NOT NULL,
+    slot     INTEGER NOT NULL,
+    PRIMARY KEY (book_id, speaker)
+);
+"""
+
+MIGRATIONS: dict[int, str] = {
+    2: MIGRATION_2, 3: MIGRATION_3, 4: MIGRATION_4, 5: MIGRATION_5, 6: MIGRATION_6,
+    7: MIGRATION_7,
+}
 SCHEMA_VERSION = max(MIGRATIONS)
 
 

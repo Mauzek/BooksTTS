@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from . import repo
-from .models import NARRATOR, Segment
+from .models import EMOTIONS, NARRATOR, Segment
 
 __all__ = [
     "EditError",
@@ -150,7 +150,7 @@ def assign_speaker(
         repo.update_segment(conn, segment_id, speaker=speaker, is_manual=True)
     return _commit(
         conn, session_id, chapter_id, "assign",
-        f"говорящий «{speaker}» для {len(segment_ids)} сегм.", before,
+        f"{_who(speaker)}: {_replicas(len(segment_ids))}", before,
     )
 
 
@@ -197,14 +197,68 @@ def assign_range(
         if end > char_end:
             rebuilt.append(_slice(segment, char_end, end))
 
-    if not touched:
-        raise EditError("выделение не попало ни в один сегмент")
+    # Текст выделения, который разметка пропустила (не попал ни в одну
+    # реплику), становится новыми репликами — по абзацам, без пустых строк.
+    text = repo.get_chapter(conn, chapter_id).text
+    for start, end in _uncovered(existing, char_start, min(char_end, len(text))):
+        for piece_start, piece_end in _paragraph_pieces(text, start, end):
+            rebuilt.append(Segment(
+                chapter_id=chapter_id, speaker=speaker, text=text[piece_start:piece_end],
+                emotion=EMOTIONS[0], is_manual=True, char_start=piece_start, char_end=piece_end,
+            ))
+            touched += 1
 
+    if not touched:
+        raise EditError("в выделении нет текста")
+
+    rebuilt.sort(key=lambda s: s.char_start if s.char_start is not None else 1 << 30)
     repo.replace_segments(conn, chapter_id, [s for s in rebuilt if s.text.strip()])
     return _commit(
         conn, session_id, chapter_id, "assign_range",
-        f"«{speaker}» на выделение ({touched} сегм.)", before,
+        f"{_who(speaker)}: {_replicas(touched)}", before,
     )
+
+
+def _who(speaker: str) -> str:
+    return "рассказчик" if speaker == NARRATOR else f"«{speaker}»"
+
+
+def _replicas(count: int) -> str:
+    mod10, mod100 = count % 10, count % 100
+    word = "реплика" if mod10 == 1 and mod100 != 11 else (
+        "реплики" if 2 <= mod10 <= 4 and not 12 <= mod100 <= 14 else "реплик")
+    return f"{count} {word}"
+
+
+def _uncovered(segments: Sequence[Segment], start: int, end: int) -> list[tuple[int, int]]:
+    """Куски [start, end), которые не покрыты ни одним сегментом."""
+    spans = sorted(
+        (s.char_start, s.char_end) for s in segments
+        if s.char_start is not None and s.char_end is not None and s.char_end > start and s.char_start < end
+    )
+    out: list[tuple[int, int]] = []
+    cursor = start
+    for span_start, span_end in spans:
+        if span_start > cursor:
+            out.append((cursor, span_start))
+        cursor = max(cursor, span_end)
+    if cursor < end:
+        out.append((cursor, end))
+    return out
+
+
+def _paragraph_pieces(text: str, start: int, end: int) -> list[tuple[int, int]]:
+    """Непустые куски текста между переводами строк, без пробелов по краям."""
+    pieces: list[tuple[int, int]] = []
+    position = start
+    for line in text[start:end].split("\n"):
+        stripped = line.strip()
+        # Тире и кавычки между репликами — не реплика: озвучивать там нечего.
+        if any(ch.isalnum() for ch in stripped):
+            begin = position + line.index(stripped)
+            pieces.append((begin, begin + len(stripped)))
+        position += len(line) + 1
+    return pieces
 
 
 def _slice(segment: Segment, start: int, end: int) -> Segment:
@@ -234,7 +288,7 @@ def split_segment(
         raise EditError("сегмент не из этой главы")
     text = segment.text
     if not 0 < offset < len(text):
-        raise EditError(f"нечего делить: позиция {offset} вне текста сегмента")
+        raise EditError("поставьте курсор внутрь фразы — на краю делить нечего")
 
     before = snapshot(conn, chapter_id)
     segments = repo.list_segments(conn, chapter_id)
@@ -298,7 +352,7 @@ def merge_segments(
     repo.replace_segments(conn, chapter_id, rebuilt)
     return _commit(
         conn, session_id, chapter_id, "merge",
-        f"склеено {len(indexes)} сегм.", before,
+        f"склеено: {_replicas(len(indexes))}", before,
     )
 
 
@@ -342,10 +396,19 @@ def rename_speaker(
             "chapter_id IN (SELECT id FROM chapter WHERE book_id = ?)",
             (new, old, chapter.book_id),
         ).rowcount
-        conn.execute(
-            'UPDATE OR REPLACE "cast" SET speaker = ? WHERE book_id = ? AND speaker = ?',
-            (new, chapter.book_id, old),
-        )
+        repo.rename_role_color(conn, chapter.book_id, old, new)
+        # Слияние с ролью, у которой уже есть голос, — её голос остаётся:
+        # «отдать реплики рассказчику» не должно менять голос рассказчика.
+        taken = conn.execute(
+            'SELECT 1 FROM "cast" WHERE book_id = ? AND speaker = ?', (chapter.book_id, new)
+        ).fetchone()
+        if taken:
+            conn.execute('DELETE FROM "cast" WHERE book_id = ? AND speaker = ?', (chapter.book_id, old))
+        else:
+            conn.execute(
+                'UPDATE "cast" SET speaker = ? WHERE book_id = ? AND speaker = ?',
+                (new, chapter.book_id, old),
+            )
         scope = "во всей книге"
     else:
         changed = conn.execute(
@@ -356,10 +419,10 @@ def rename_speaker(
         scope = "в главе"
 
     if not changed:
-        raise EditError(f"сегментов с говорящим «{old}» не нашлось")
+        raise EditError(f"реплик роли «{old}» не нашлось")
     return _commit(
         conn, session_id, chapter_id, "rename",
-        f"«{old}» → «{new}» {scope} ({changed} сегм.)", before,
+        f"{_who(old)} → {_who(new)} {scope}: {_replicas(changed)}", before,
     )
 
 

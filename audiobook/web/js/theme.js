@@ -21,10 +21,20 @@ export function currentTheme() {
   }
 }
 
-export function applyTheme(theme) {
+/**
+ * Сменить тему. При смене вручную — одним плавным переходом всей страницы
+ * (View Transitions): раньше каждый элемент перетекал сам по себе, а
+ * иконки и градиенты переключались мгновенно — кнопки «моргали».
+ */
+export function applyTheme(theme, { animate = false } = {}) {
   const root = document.documentElement;
-  if (theme === 'auto') root.removeAttribute('data-theme');
-  else root.setAttribute('data-theme', theme);
+  const set = () => {
+    if (theme === 'auto') root.removeAttribute('data-theme');
+    else root.setAttribute('data-theme', theme);
+  };
+  const calm = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  if (animate && document.startViewTransition && !calm) document.startViewTransition(set);
+  else set();
   try {
     localStorage.setItem(KEY, theme);
   } catch {
@@ -37,7 +47,7 @@ export function applyTheme(theme) {
 export function nextTheme() {
   const names = THEMES.map(([name]) => name);
   const index = names.indexOf(currentTheme());
-  return applyTheme(names[(index + 1) % names.length]);
+  return applyTheme(names[(index + 1) % names.length], { animate: true });
 }
 
 export function themeIcon(theme = currentTheme()) {

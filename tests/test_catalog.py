@@ -256,8 +256,13 @@ for line in sys.stdin:
 
 
 @pytest.fixture()
-def qwen_worker(tmp_path, library):
+def qwen_worker(tmp_path, library, monkeypatch):
     import sys
+
+    # Своя временная папка на тест: общая системная копила бы файлы между тестами.
+    scratch = tmp_path / "qwen-scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(qwen_module, "scratch_dir", lambda: scratch)
 
     script = tmp_path / "fake_worker.py"
     script.write_text(FAKE_WORKER, encoding="utf-8")
@@ -267,7 +272,7 @@ def qwen_worker(tmp_path, library):
 
 def _last_request():
     # Имена файлов случайные — «последний» определяем по времени записи.
-    requests = sorted((paths.cache_dir() / "qwen").glob("*.wav.json"),
+    requests = sorted(qwen_module.scratch_dir().glob("*.wav.json"),
                       key=lambda p: p.stat().st_mtime_ns)
     import json
 
@@ -346,7 +351,7 @@ def _qwen_chapter(conn, marked, qwen_worker, batch):
 
 
 def _batches() -> list[int]:
-    log = paths.cache_dir() / "qwen" / "batches.log"
+    log = qwen_module.scratch_dir() / "batches.log"
     return [int(n) for n in log.read_text(encoding="utf-8").split()] if log.exists() else []
 
 
@@ -494,6 +499,18 @@ def test_auto_assign_is_stable_and_spreads_voices(conn, fake, marked):
     assert {i["speaker"]: i["voice"]["voice_key"] for i in again} == names
 
 
+def test_auto_assign_fills_roles_whose_voice_was_removed(conn, fake, marked):
+    """«Снять голос» оставляет строку без голоса — подбор обязан её заполнить."""
+    catalog.refresh(conn)
+    catalog.auto_assign(conn, marked.book_id)
+    for speaker in ("narrator", "Велимир", "Аглая"):
+        catalog.assign(conn, marked.book_id, speaker, None)
+
+    filled = catalog.auto_assign(conn, marked.book_id)
+    assert {item["speaker"] for item in filled} == {"narrator", "Велимир", "Аглая"}
+    assert all(entry.voice_id for entry in repo.cast_map(conn, marked.book_id).values())
+
+
 def test_auto_assign_without_a_catalog_explains_what_to_do(conn, marked):
     with pytest.raises(catalog.CatalogError, match="обновите каталог"):
         catalog.auto_assign(conn, marked.book_id)
@@ -606,3 +623,70 @@ def test_empty_key_is_refused(vault):
 def test_unknown_service_is_named(vault):
     with pytest.raises(secrets.SecretsError, match="неизвестная служба"):
         secrets.get_key("openai")
+
+
+def _fake_qwen_home(root):
+    python = qwen_module.python_in(root)
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    model = root / "huggingface" / "hub" / "model.bin"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"x" * 4096)
+    return root
+
+
+def test_qwen_folder_moves_whole_and_old_one_goes_away(tmp_path):
+    source = _fake_qwen_home(tmp_path / "old")
+    target = tmp_path / "other-disk" / "qwen"
+    seen = []
+    result = qwen_module.relocate(source, target, on_progress=lambda done, total: seen.append((done, total)))
+    assert qwen_module.python_in(target).is_file()
+    assert (target / "huggingface" / "hub" / "model.bin").stat().st_size == 4096
+    assert not source.exists() and result["left_behind"] == ""
+    assert seen[-1][0] == seen[-1][1]
+
+
+def test_qwen_folder_is_not_moved_into_a_busy_folder(tmp_path):
+    source = _fake_qwen_home(tmp_path / "old")
+    target = tmp_path / "busy"
+    target.mkdir()
+    (target / "чужое.txt").write_text("не трогать", encoding="utf-8")
+    with pytest.raises(EngineError, match="не пуста"):
+        qwen_module.relocate(source, target)
+    assert qwen_module.python_in(source).is_file()
+
+
+def test_samples_are_made_ahead_only_for_free_engines(conn, monkeypatch):
+    """Образец Silero делается заранее; платный ElevenLabs — только по нажатию."""
+    from audiobook.core.models import Voice
+
+    aidar = repo.upsert_voice(conn, Voice(engine="silero", voice_key="aidar"))
+    repo.upsert_voice(conn, Voice(engine="elevenlabs", voice_key="rachel"))
+    monkeypatch.setattr(catalog, "engines_status", lambda _conn: [
+        {"name": "silero", "ready": True, "needs_key": False},
+        {"name": "elevenlabs", "ready": True, "needs_key": True},
+    ])
+    made = []
+    monkeypatch.setattr(catalog, "preview", lambda _conn, voice_id, **_: made.append(voice_id) or {})
+    result = catalog.make_previews(conn)
+    assert made == [aidar.id] and result["done"] == 1
+
+
+def test_new_sample_phrase_resets_old_samples(conn):
+    from audiobook.core.models import Voice
+
+    voice = repo.upsert_voice(conn, Voice(engine="silero", voice_key="aidar"))
+    repo.set_voice_preview(conn, voice.id, "previews/old.wav")
+    catalog.save_settings(conn, {"preview.text": "Совсем другая фраза."})
+    assert repo.get_voice(conn, voice.id).preview_path is None
+
+
+def test_qwen_samples_are_made_in_one_batch(conn, qwen_worker, monkeypatch):
+    """По одному Qwen пишет фразу секунд двадцать — образцы идут пачкой."""
+    for key in ("Ryan", "Serena", "Aiden"):
+        repo.upsert_voice(conn, Voice(engine="qwen", voice_key=key))
+    catalog.save_settings(conn, qwen_worker)
+    monkeypatch.setattr(catalog, "engines_status", lambda _conn: [{"name": "qwen", "ready": True, "needs_key": False}])
+    result = catalog.make_previews(conn)
+    assert result["done"] == 3 and _batches() == [3]
+    assert all(v.preview_path for v in repo.list_voices(conn, engine="qwen"))

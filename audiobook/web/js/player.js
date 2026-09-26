@@ -19,8 +19,10 @@ const state = {
   queue: [],         // очередь глав
   index: -1,         // место в очереди
   rate: 1,
+  volume: 1,
   skipSilence: false,
   error: '',
+  notice: '',        // «Книга дослушана» — плеер остановился в конце книги
   sleep: null,       // таймер сна: {mode: 'time', endsAt} или {mode: 'chapter'}
 };
 
@@ -31,18 +33,22 @@ function loadSettings() {
   try {
     const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
     state.rate = Number(saved.rate) || 1;
+    state.volume = saved.volume === undefined ? 1 : Math.min(1, Math.max(0, Number(saved.volume) || 0));
     state.skipSilence = Boolean(saved.skipSilence);
   } catch { /* настройки плеера — не данные, можно и без них */ }
 }
 
 function saveSettings() {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ rate: state.rate, skipSilence: state.skipSilence }));
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+      rate: state.rate, volume: state.volume, skipSilence: state.skipSilence,
+    }));
   } catch { /* приватный режим */ }
 }
 
 loadSettings();
 audio.playbackRate = state.rate;
+audio.volume = state.volume;
 
 // ---------- подписка ----------
 
@@ -74,7 +80,7 @@ function clearSleep() {
   clearTimeout(sleepTimer);
   sleepTimer = null;
   state.sleep = null;
-  audio.volume = 1;
+  audio.volume = state.volume;
 }
 
 /** Уснуть через ``minutes`` минут; ``'chapter'`` — в конце главы; 0 — выключить. */
@@ -97,7 +103,8 @@ export function setSleepTimer(minutes) {
 function fadeBeforeSleep() {
   if (state.sleep?.mode !== 'time') return;
   const left = state.sleep.endsAt - Date.now();
-  audio.volume = left < FADE_MS ? Math.max(0, left / FADE_MS) : 1;
+  // Затухание — доля от выбранной громкости, а не замена ей.
+  audio.volume = state.volume * (left < FADE_MS ? Math.max(0, left / FADE_MS) : 1);
 }
 
 export function currentSegment() {
@@ -113,6 +120,22 @@ export async function playChapter(chapterId, { positionMs = null, queue = null, 
     state.index = index ?? queue.findIndex((item) => item.chapter_id === chapterId);
   }
   const data = await get(`/api/chapters/${chapterId}`);
+  // Глава не из текущей очереди — очередь становится её книгой. Иначе после
+  // неё заиграла бы глава совсем другой книги, оставшейся в очереди.
+  if (!queue) {
+    const at = state.queue.findIndex((item) => item.chapter_id === chapterId);
+    if (at >= 0) {
+      state.index = at;
+    } else {
+      const book = await get(`/api/books/${data.book.id}/playback`).catch(() => null);
+      const ready = book ? book.chapters.filter((c) => c.ready) : [];
+      if (ready.length) {
+        await setQueue(ready);
+        state.index = ready.findIndex((item) => item.chapter_id === chapterId);
+      }
+    }
+  }
+  state.notice = '';
   if (!data.chapter.audio_path) {
     state.error = 'глава ещё не озвучена';
     publish();
@@ -123,12 +146,17 @@ export async function playChapter(chapterId, { positionMs = null, queue = null, 
     chapter_id: chapterId,
     book_id: data.book.id,
     book_title: data.book.title,
+    book_author: data.book.author,
+    has_cover: Boolean(data.book.cover_path),
+    cover_path: data.book.cover_path ?? null,
+    genres: data.book.genres || [],
+    moods: data.book.moods || [],
     label: data.chapter.label,
     duration_ms: data.chapter.duration_ms,
   };
   state.segments = data.segments
     .filter((s) => s.audio_start_ms !== null && s.audio_end_ms !== null)
-    .map((s) => ({ id: s.id, speaker: s.speaker, text: s.text, color: s.color,
+    .map((s) => ({ id: s.id, speaker: s.speaker, text: s.text, color: s.color, slot: s.slot, emotion: s.emotion,
                    audio_start_ms: s.audio_start_ms, audio_end_ms: s.audio_end_ms }));
 
   let start = positionMs;
@@ -212,6 +240,13 @@ export function setRate(rate) {
   publish();
 }
 
+export function setVolume(volume) {
+  state.volume = Math.min(1, Math.max(0, Number(volume) || 0));
+  audio.volume = state.volume;
+  saveSettings();
+  publish();
+}
+
 export function setSkipSilence(enabled) {
   state.skipSilence = Boolean(enabled);
   saveSettings();
@@ -291,13 +326,21 @@ audio.addEventListener('timeupdate', () => {
   savePosition();
   publish();
 });
-audio.addEventListener('play', () => { updateMediaSession(); publish(); });
+audio.addEventListener('play', () => { state.notice = ''; updateMediaSession(); publish(); });
 audio.addEventListener('pause', () => { savePosition(true); publish(); });
 audio.addEventListener('ended', () => {
   savePosition(true);
   if (state.sleep?.mode === 'chapter') {
     // «До конца главы»: следующую не начинаем.
     clearSleep();
+    publish();
+    return;
+  }
+  // Сами переходим только к главе той же книги: закончилась книга — тишина,
+  // а не чужая книга из очереди. Дальше — кнопкой «Следующая», если хочется.
+  const upcoming = state.queue[state.index + 1];
+  if (!upcoming || upcoming.book_id !== state.entry?.book_id) {
+    state.notice = upcoming ? 'Книга дослушана' : 'Книга дослушана до конца';
     publish();
     return;
   }

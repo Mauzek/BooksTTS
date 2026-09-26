@@ -91,6 +91,18 @@ def test_book_speakers_span_all_chapters(conn, marked):
     assert "Терех" in repo.book_speakers(conn, marked.book_id)
 
 
+def test_role_colors_are_distinct_within_a_book(conn, marked):
+    """Цвет — по частоте внутри книги, а не хэш имени: у героев он не совпадёт."""
+    other = repo.create_chapter(conn, book_id=marked.book_id, number=2, text="текст")
+    names = ["Терех", "Мирон", "Олеся", "Гордей", "Варвара", "Святослав"]
+    repo.replace_segments(conn, other.id, [Segment(speaker=n, text=f"Реплика {n}.") for n in names])
+    slots = repo.role_slots(conn, marked.book_id)
+    assert slots["narrator"] == 0
+    heroes = [slots[n] for n in repo.book_speakers(conn, marked.book_id) if n != "narrator"]
+    assert heroes[:repo.ROLE_SLOTS] == list(range(1, repo.ROLE_SLOTS + 1))
+    assert heroes[repo.ROLE_SLOTS] == 1  # седьмой — по кругу
+
+
 def test_manual_flag_survives_a_round_trip(conn, marked):
     first = repo.list_segments(conn, marked.id)[0]
     repo.update_segment(conn, first.id, is_manual=True)
@@ -194,3 +206,21 @@ def test_active_jobs_exclude_finished(conn):
     finished = repo.create_job(conn, kind="synthesis")
     repo.update_job(conn, finished.id, status="done")
     assert len(repo.list_jobs(conn, active_only=True)) == 1
+
+
+def test_role_color_stays_when_line_counts_change(conn, marked):
+    """Цвет роли не перекрашивается от правки разметки."""
+    before = repo.role_slots(conn, marked.book_id)
+    # Аглая становится главной: реплик у неё теперь больше, чем у Велимира.
+    for segment in repo.list_segments(conn, marked.id):
+        if segment.speaker == "narrator":
+            repo.update_segment(conn, segment.id, speaker="Аглая")
+    after = repo.role_slots(conn, marked.book_id)
+    assert after["Аглая"] == before["Аглая"] and after["Велимир"] == before["Велимир"]
+
+
+def test_chosen_role_color_is_kept(conn, marked):
+    repo.set_role_slot(conn, marked.book_id, "Велимир", 5)
+    assert repo.role_slots(conn, marked.book_id)["Велимир"] == 5
+    with pytest.raises(repo.InvalidOperation):
+        repo.set_role_slot(conn, marked.book_id, "Велимир", 9)

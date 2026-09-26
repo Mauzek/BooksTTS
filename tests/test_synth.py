@@ -349,3 +349,23 @@ def test_finished_jobs_wait_to_be_announced(db, conn, voiced, engine):
         assert [j.id for j in repo.unnotified_jobs(check)] == [job.id]
         repo.update_job_fields(check, job.id, notified=True)
         assert repo.unnotified_jobs(check) == []
+
+
+def test_line_of_bare_punctuation_becomes_a_pause(conn, voiced, engine):
+    """«?», оставшийся после разделения, — пауза, а не ошибка движка."""
+    segments = repo.list_segments(conn, voiced.id)
+    repo.update_segment(conn, segments[1].id, text="?")
+    result = synth.synthesize_chapter(conn, voiced.id)
+    assert result["failed"] == []
+    assert "?" not in [text for text, _ in engine.calls]
+    assert repo.get_segment(conn, segments[1].id).audio_path
+
+
+def test_runaway_qwen_phrase_is_detected():
+    from audiobook.core.engines import qwen
+
+    phrase = "Дождь кончился час назад."
+    normal = silero_module.wav_bytes([0] * 24000 * 2, 24000)   # 2 с — нормально
+    babble = silero_module.wav_bytes([0] * 24000 * 12, 24000)  # 12 с — сорвалась
+    assert not qwen.runaway(normal, phrase)
+    assert qwen.runaway(babble, phrase)

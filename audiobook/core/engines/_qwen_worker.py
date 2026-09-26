@@ -58,6 +58,12 @@ def stub_sox() -> None:
 
 def load(model_name: str):
     stub_sox()
+    # numba по умолчанию пишет кеш рядом с библиотекой; Python из Microsoft
+    # Store там писать не может и зависает в бесконечных попытках.
+    import os
+    import tempfile
+
+    os.environ.setdefault("NUMBA_CACHE_DIR", os.path.join(tempfile.gettempdir(), "booktts-qwen", "numba"))
     import torch
     from qwen_tts import Qwen3TTSModel
 

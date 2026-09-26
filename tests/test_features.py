@@ -70,10 +70,11 @@ def test_book_without_markup_is_not_ready(conn, chapter):
 # --------------------------------------------------------------------------
 
 
-def test_progress_counts_previous_chapters_and_position(conn, marked):
+def test_progress_counts_listened_chapters_and_position(conn, marked):
     repo.update_chapter(conn, marked.id, audio_path="audio/1.mp3", duration_ms=1000)
     second = repo.create_chapter(conn, marked.book_id, 2, "Вторая", "Текст.")
     repo.update_chapter(conn, second.id, audio_path="audio/2.mp3", duration_ms=3000)
+    repo.set_playback(conn, marked.book_id, marked.id, 1000)  # первая дослушана
     repo.set_playback(conn, marked.book_id, second.id, 1500)
 
     item = repo.recent_playback(conn)[0]

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -84,13 +85,34 @@ class Book:
     cover_path: str | None = None  # относительный путь
     language: str = "ru"
     created_at: str = ""
+    year: int | None = None
+    country: str = ""
+    description: str = ""
+    genres: list[str] = field(default_factory=list)
+    moods: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    info_source: str = ""  # "ai" — сведения подобрала нейросеть
+    info_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_row(cls, row) -> "Book":
-        return _row_to(cls, row)
+        book = _row_to(cls, row)
+        # Списки лежат в базе JSON-строкой; битая строка — пустой список.
+        for name in BOOK_LISTS:
+            value = getattr(book, name)
+            if isinstance(value, str):
+                try:
+                    decoded = json.loads(value or "[]")
+                except ValueError:
+                    decoded = []
+                setattr(book, name, [str(x) for x in decoded] if isinstance(decoded, list) else [])
+        return book
+
+
+BOOK_LISTS = ("genres", "moods", "tags")
 
 
 @dataclass
@@ -104,6 +126,7 @@ class Chapter:
     audio_hash: str | None = None
     duration_ms: int | None = None
     created_at: str = ""
+    listened_at: str | None = None  # дослушана до конца; не сбрасывается при повторе
 
     @property
     def label(self) -> str:

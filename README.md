@@ -38,8 +38,8 @@
 
 Необязательный движок: девять выразительных голосов, которые передают эмоцию
 реплики интонацией. Нужна видеокарта NVIDIA с 6 ГБ памяти или больше; модель и
-окружение занимают около 10 ГБ на диске и ставятся в `%LOCALAPPDATA%\BookTTS-qwen`
-отдельно от приложения:
+окружение занимают около 10 ГБ на диске и ставятся рядом с установленным
+приложением (папка `qwen`) отдельно от него; перенести их можно в «Настройках»:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File desktop\install-qwen.ps1
@@ -81,8 +81,10 @@ python -m audiobook serve         # интерфейс в браузере: http
 powershell -File desktop\dev.ps1
 ```
 
-`target/` Rust и сборка бэкенда уходят в `%LOCALAPPDATA%\BookTTS-build` —
+`target/` Rust и сборка бэкенда (около 12 ГБ) уходят в `%LOCALAPPDATA%\BookTTS-build` —
 проект может лежать в OneDrive, и гигабайты артефактов там синхронизировались бы.
+Чтобы не занимать системный диск, задайте другую папку переменной окружения:
+`setx BOOKTTS_BUILD_DIR E:\BookTTS-build`.
 
 ### Устройство
 
@@ -116,8 +118,8 @@ powershell -File desktop\build.ps1   # установщик на этой маш
 `desktop/src-tauri/Cargo.toml` и `audiobook/__init__.py`, затем
 
 ```bash
-git tag v0.3.1
-git push origin v0.3.1
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 CI (`.github/workflows/release.yml`) прогонит тесты, соберёт установщик и

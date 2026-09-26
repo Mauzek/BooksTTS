@@ -8,6 +8,7 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "backend_status",
             "restart_backend",
+            "notify",
             "app_version",
             "check_update",
             "install_update",

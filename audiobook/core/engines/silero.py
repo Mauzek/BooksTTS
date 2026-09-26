@@ -219,7 +219,8 @@ class SileroEngine:
                         speaker=voice_key, sample_rate=self.sample_rate,
                     )
             except Exception as exc:  # noqa: BLE001 — модель кидает своё
-                raise EngineError(f"silero не справился с репликой: {exc}") from exc
+                reason = str(exc).strip() or type(exc).__name__
+                raise EngineError(f"silero не справился с фразой «{chunk[:60]}»: {reason}") from exc
             waves.append(audio)
 
         audio = torch.cat(waves) if len(waves) > 1 else waves[0]

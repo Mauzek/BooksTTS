@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 from fakes import FakeClient
 from test_markup import dialogue
@@ -42,6 +44,85 @@ def test_app_page_and_its_scripts_are_served(http):
     assert script.status_code == 200
     # WebView2 кеширует агрессивно: без no-cache правки интерфейса не видны.
     assert script.headers["cache-control"] == "no-cache"
+
+
+def test_every_asset_the_interface_references_is_served(http):
+    """Опечатка в пути стиля, шрифта или модуля в окне видна только пустым экраном."""
+    import re
+    from pathlib import Path
+
+    page = http.get("/").text
+    web = Path(__file__).resolve().parent.parent / "audiobook" / "web"
+    refs = set(re.findall(r'(?:href|src)="(/ui/[^"#]+)', page))
+    for css in (web / "css").glob("*.css"):
+        refs |= {f"/ui/css/{url}" for url in re.findall(r"url\(([^)\"']+)\)", css.read_text(encoding="utf-8"))}
+    for module in (web / "js").rglob("*.js"):
+        for target in re.findall(r"from '(\.{1,2}/[^']+)'", module.read_text(encoding="utf-8")):
+            resolved = (module.parent / target).resolve().relative_to(web.resolve())
+            refs.add("/ui/" + resolved.as_posix())
+    assert refs, "в странице не нашлось ни одной ссылки"
+    missing = []
+    for ref in sorted(refs):
+        normalized = re.sub(r"/[^/]+/\.\./", "/", ref)
+        if http.get(normalized).status_code != 200:
+            missing.append(ref)
+    assert not missing
+
+
+def test_desktop_keeps_one_port_between_launches():
+    """Новый порт — новый адрес окна, а с ним забытые тема и настройки плеера."""
+    from audiobook.api.app import bind_socket
+
+    first = bind_socket("127.0.0.1", 0, prefer=0)
+    free = first.getsockname()[1]
+    first.close()
+    again = bind_socket("127.0.0.1", 0, prefer=free)
+    assert again.getsockname()[1] == free
+    # Занят — берём любой другой, а не падаем.
+    busy = bind_socket("127.0.0.1", 0, prefer=free)
+    assert busy.getsockname()[1] != free
+    again.close()
+    busy.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ловушка только Windows")
+def test_stdin_watch_does_not_freeze_dll_loading():
+    """Блокирующее чтение stdin вешало загрузку DLL numpy в другой нити — и весь бэкенд."""
+    import subprocess
+    import threading
+    import time
+    from pathlib import Path
+
+    pytest.importorskip("numpy")
+    root = Path(__file__).resolve().parent.parent
+    child_code = (
+        "import sys, threading, time\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
+        "from audiobook.api.app import _exit_when_stdin_closes\n"
+        "class Server: should_exit = False\n"
+        "server = Server()\n"
+        "threading.Thread(target=_exit_when_stdin_closes, args=(server,), daemon=True).start()\n"
+        "time.sleep(0.5)\n"
+        "import numpy\n"
+        "print('imported', flush=True)\n"
+        "while not server.should_exit: time.sleep(0.1)\n"
+        "print('exit', flush=True)\n"
+    )
+    child = subprocess.Popen([sys.executable, "-c", child_code], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, text=True)
+    lines = []
+    reader = threading.Thread(target=lambda: lines.extend(line.strip() for line in child.stdout), daemon=True)
+    reader.start()
+    try:
+        deadline = time.time() + 30
+        while "imported" not in lines and time.time() < deadline:
+            time.sleep(0.1)
+        assert "imported" in lines, "импорт numpy завис при живой нити stdin"
+        child.stdin.close()  # окно закрылось — бэкенд должен это заметить
+        child.wait(10)
+        assert lines[-1] == "exit"
+    finally:
+        child.kill()
 
 
 def test_client_errors_are_logged(http, caplog):
@@ -540,6 +621,19 @@ def test_audio_is_missing_until_the_chapter_is_voiced(http, marked):
     response = http.get(f"/api/chapters/{marked.id}/audio")
     assert response.status_code == 404
     assert "не озвучена" in response.json()["detail"]
+
+
+def test_shared_dictionary_and_studio_overview(http, marked):
+    rules = http.put("/api/pronunciations", json={"term": "т. е.", "replacement": "то есть"}).json()["rules"]
+    assert rules[0]["book_id"] is None and rules[0]["book_title"] is None
+    http.put("/api/pronunciations", json={"term": "Терех", "replacement": "Т+ерех", "book_id": marked.book_id})
+    rules = http.get("/api/pronunciations").json()["rules"]
+    assert [r["term"] for r in rules] == ["т. е.", "Терех"]  # общие — первыми
+    assert http.delete(f"/api/pronunciations/{rules[0]['id']}").json()["rules"][0]["term"] == "Терех"
+
+    books = http.get("/api/studio").json()["books"]
+    assert books[0]["marked"] == 1 and books[0]["voiced"] == 0
+    assert books[0]["roles"] == 3 and books[0]["missing_voice"] == 3
 
 
 def test_pronunciation_rules_round_trip(http, marked):

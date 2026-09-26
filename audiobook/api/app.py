@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import paths
-from ..core import catalog
+from ..core import bookinfo, catalog
 from ..core import checks as checks_mod
 from ..core import editing, jobs, library, repo, secrets, synth
 from ..core import export as export_mod
@@ -57,6 +57,27 @@ TOKEN_HEADER = "x-booktts-token"
 CSRF_HEADER = "x-requested-with"
 CSRF_VALUE = "booktts"
 READY_PREFIX = "BOOKTTS_READY "
+
+
+# Для ошибок проверки запроса: имя поля и суть ошибки по-русски.
+FIELD_NAMES = {
+    "title": "название", "author": "автор", "year": "год", "country": "страна",
+    "text": "текст", "name": "имя", "path": "путь к файлу", "key": "ключ",
+    "speaker": "роль", "term": "слово", "offset": "место в тексте",
+}
+VALIDATION_TEXT = {
+    "missing": "не заполнено",
+    "string_too_short": "не заполнено",
+    "string_too_long": "слишком длинно",
+    "int_parsing": "нужно целое число",
+    "int_type": "нужно целое число",
+    "float_parsing": "нужно число",
+    "greater_than_equal": "слишком маленькое значение",
+    "less_than_equal": "слишком большое значение",
+    "json_invalid": "запрос не разобрать",
+    "list_type": "нужен список",
+    "string_type": "нужен текст",
+}
 
 
 def color_for(speaker: str) -> str:
@@ -141,6 +162,38 @@ def create_app(
     class BookPatch(BaseModel):
         title: str | None = None
         author: str | None = None
+        year: int | None = None
+        country: str | None = None
+        description: str | None = None
+        genres: list[str] | None = None
+        moods: list[str] | None = None
+        tags: list[str] | None = None
+        info_source: str | None = None  # "ai" — сведения подобрала нейросеть
+
+    class DescribeRequest(BaseModel):
+        title: str = Field(min_length=1)
+        author: str = ""
+        year: int | None = None
+        country: str = ""
+
+    class ChapterFileRequest(BaseModel):
+        path: str = Field(min_length=1)
+        after: int | None = None  # номер главы, после которой вставить; None — в конец
+
+    class RoleColorRequest(BaseModel):
+        speaker: str = Field(min_length=1)
+        slot: int = Field(ge=0, le=6)
+
+    class QwenMoveRequest(BaseModel):
+        target: str = Field(min_length=1)
+
+    class ListenedRequest(BaseModel):
+        listened: bool = True
+
+    class ChapterTextRequest(BaseModel):
+        text: str = ""
+        title: str = ""
+        after: int | None = None
 
     class ChapterPatch(BaseModel):
         title: str
@@ -207,6 +260,9 @@ def create_app(
         whole_word: bool = True
         case_sensitive: bool = False
 
+    class ScopedPronunciationRequest(PronunciationRequest):
+        book_id: int | None = None  # None — правило для всех книг
+
     app = FastAPI(title="BookTTS", docs_url="/api/docs", redoc_url=None)
     app.state.db = db or Database().setup()
     app.state.base_url = base_url
@@ -263,8 +319,30 @@ def create_app(
     @app.exception_handler(secrets.SecretsError)
     @app.exception_handler(EngineError)
     @app.exception_handler(ExportError)
+    @app.exception_handler(bookinfo.BookInfoError)
     def _bad_request(request, exc):  # noqa: ARG001
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    from fastapi.exceptions import RequestValidationError
+
+    @app.exception_handler(RequestValidationError)
+    def _invalid(request, exc):  # noqa: ARG001
+        """Ошибки проверки запроса по-русски: «Field required» ничего не скажет."""
+        parts = []
+        for error in exc.errors():
+            loc = [str(x) for x in error.get("loc", ()) if x not in ("body", "query", "path")]
+            field = FIELD_NAMES.get(loc[-1], loc[-1]) if loc else "запрос"
+            parts.append(f"{field} — {VALIDATION_TEXT.get(error.get('type', ''), error.get('msg', ''))}")
+        return JSONResponse(status_code=422, content={"detail": "проверьте данные: " + "; ".join(parts)})
+
+    @app.exception_handler(Exception)
+    def _crash(request, exc):  # noqa: ARG001
+        """Непредвиденная ошибка — понятный ответ вместо «Internal Server Error»."""
+        log.exception("ошибка при обработке %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"внутренняя ошибка ({type(exc).__name__}): {exc}"[:500]},
+        )
 
     def _view(conn, chapter_id: int) -> dict:
         data = library.chapter_view(conn, chapter_id)
@@ -376,7 +454,10 @@ def create_app(
 
     @app.patch("/api/books/{book_id}")
     def update_book(book_id: int, request: BookPatch):
-        fields = {k: v for k, v in request.model_dump().items() if v is not None}
+        # Только присланные поля: так год можно и стереть (null), и не трогать.
+        fields = request.model_dump(exclude_unset=True)
+        if fields.get("title") is None:
+            fields.pop("title", None)
         with app.state.db.connect() as conn:
             return repo.update_book(conn, book_id, **fields).to_dict()
 
@@ -404,6 +485,134 @@ def create_app(
         if not cover.is_file():
             raise HTTPException(404, "файл обложки не найден")
         return FileResponse(cover)
+
+    @app.put("/api/books/{book_id}/cover")
+    async def upload_cover(book_id: int, request: Request):
+        """Своя обложка: тело запроса — картинка."""
+        data = await request.body()
+        with app.state.db.connect() as conn:
+            return library.set_cover(conn, book_id, data).to_dict()
+
+    @app.delete("/api/books/{book_id}/cover")
+    def delete_cover(book_id: int):
+        with app.state.db.connect() as conn:
+            return library.remove_cover(conn, book_id).to_dict()
+
+    @app.get("/api/engines/qwen/home")
+    def qwen_home(size: bool = False):
+        """Где лежит Qwen и куда его лучше перенести."""
+        import shutil as _shutil
+
+        from ..core.engines import qwen as qwen_engine
+
+        with app.state.db.connect() as conn:
+            options = catalog.settings(conn)
+        engine = qwen_engine.engine(options)
+        beside = qwen_engine.suggested_home()
+        free = None
+        if beside is not None:
+            try:
+                free = _shutil.disk_usage(qwen_engine._existing_parent(beside)).free
+            except OSError:
+                free = None
+        return {
+            "home": str(engine.home),
+            "installed": engine.installed(),
+            "size": qwen_engine.folder_size(engine.home) if size and engine.installed() else None,
+            "suggested": str(beside) if beside else "",
+            "suggested_free": free,
+            "program_dir": str(qwen_engine.program_dir() or ""),
+            "same_drive": bool(beside) and Path(engine.home).anchor.lower() == Path(beside).anchor.lower(),
+        }
+
+    @app.post("/api/engines/qwen/move")
+    def qwen_move(request: QwenMoveRequest):
+        from ..core.engines import qwen as qwen_engine
+
+        with app.state.db.connect() as conn:
+            options = catalog.settings(conn)
+        source = qwen_engine.engine(options).home
+        target = Path(request.target).expanduser()
+        if not target.is_absolute():
+            raise HTTPException(400, "укажите полный путь, например E:\\Programs\\BookTTS\\qwen")
+        job = app.state.queue.enqueue(
+            jobs.KIND_QWEN_MOVE, None, title=f"Перенос Qwen3-TTS в {target}",
+            params={"source": str(source), "target": str(target)},
+        )
+        return job.to_dict()
+
+    @app.put("/api/books/{book_id}/role-color")
+    def role_color(book_id: int, request: RoleColorRequest):
+        """Свой цвет роли — вместо выданного автоматически."""
+        with app.state.db.connect() as conn:
+            return {"slots": repo.set_role_slot(conn, book_id, request.speaker, request.slot)}
+
+    @app.get("/api/book-vocabulary")
+    def book_vocabulary():
+        return bookinfo.vocabulary()
+
+    @app.post("/api/books/{book_id}/describe")
+    def describe_book(book_id: int, request: DescribeRequest):
+        """Подобрать жанры, настроение, метки и описание через Claude. Ничего не сохраняет."""
+        with app.state.db.connect() as conn:
+            return bookinfo.suggest_info(
+                conn, book_id, title=request.title, author=request.author,
+                year=request.year, country=request.country,
+                client=app.state.client, base_url=app.state.base_url,
+            )
+
+    def _chapters_payload(conn, created) -> dict:
+        return {"chapters": [c.to_dict(with_text=False) for c in created]}
+
+    @app.post("/api/books/{book_id}/chapters/import")
+    def add_chapters_file(book_id: int, request: ChapterFileRequest):
+        source = Path(request.path).expanduser()
+        if not source.is_file():
+            raise HTTPException(400, f"файл не найден: {source}")
+        with app.state.db.connect() as conn:
+            return _chapters_payload(conn, library.add_chapters_from_file(conn, book_id, source, request.after))
+
+    @app.put("/api/books/{book_id}/chapters/upload")
+    async def add_chapters_upload(book_id: int, request: Request, filename: str, after: int | None = None):
+        """То же из браузера или перетаскиванием: тело — сам файл."""
+        from starlette.concurrency import run_in_threadpool
+
+        name = Path(filename).name
+        if not name or not name.lower().endswith(SUPPORTED_EXTENSIONS):
+            raise HTTPException(400, f"поддерживаются: {', '.join(SUPPORTED_EXTENSIONS)}")
+        data = await request.body()
+        if not data:
+            raise HTTPException(400, "пустой файл")
+
+        def store_and_add() -> dict:
+            uploads = paths.cache_dir() / "uploads"
+            uploads.mkdir(parents=True, exist_ok=True)
+            temporary = uploads / name
+            temporary.write_bytes(data)
+            try:
+                with app.state.db.connect() as conn:
+                    return _chapters_payload(conn, library.add_chapters_from_file(conn, book_id, temporary, after))
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        return await run_in_threadpool(store_and_add)
+
+    @app.post("/api/books/{book_id}/chapters")
+    def add_chapter_text(book_id: int, request: ChapterTextRequest):
+        with app.state.db.connect() as conn:
+            created = library.add_chapter_from_text(conn, book_id, request.text, request.title, request.after)
+            return _chapters_payload(conn, [created])
+
+    @app.put("/api/chapters/{chapter_id}/listened")
+    def mark_listened(chapter_id: int, request: ListenedRequest):
+        with app.state.db.connect() as conn:
+            return repo.set_chapter_listened(conn, chapter_id, request.listened).to_dict(with_text=False)
+
+    @app.delete("/api/chapters/{chapter_id}")
+    def delete_chapter(chapter_id: int):
+        with app.state.db.connect() as conn:
+            library.remove_chapter(conn, chapter_id)
+            return {"deleted": chapter_id}
 
     @app.put("/api/books/upload")
     async def upload_book(request: Request, filename: str, folder_id: int | None = None):
@@ -645,6 +854,19 @@ def create_app(
                 language=language or None, search=q or None, available_only=not all_voices,
             )}
 
+    @app.post("/api/voices/previews")
+    def prepare_previews():
+        """Поставить в очередь образцы голосов, которых ещё нет. Уже идёт — не дублировать."""
+        with app.state.db.connect() as conn:
+            missing = len(catalog.missing_previews(conn))
+            running = next((j for j in repo.list_jobs(conn, active_only=True) if j.kind == jobs.KIND_PREVIEWS), None)
+        if running:
+            return {"job": running.to_dict(), "missing": missing}
+        if not missing:
+            return {"job": None, "missing": 0}
+        job = app.state.queue.enqueue(jobs.KIND_PREVIEWS, None, title=f"Образцы голосов ({missing})")
+        return {"job": job.to_dict(), "missing": missing}
+
     @app.post("/api/voices/{voice_id}/preview")
     def preview_voice(voice_id: int, request: PreviewRequest):
         with app.state.db.connect() as conn:
@@ -775,22 +997,36 @@ def create_app(
         )
         return job.to_dict()
 
+    def _job_view(conn, job) -> dict:
+        """Задача с книгой, к которой она относится: по ней интерфейс ведёт на нужный экран."""
+        data = job.to_dict()
+        book_id = None
+        if job.kind in ("book", "markup_book", "export"):
+            book_id = job.target_id
+        elif job.kind in ("synthesis", "markup") and job.target_id is not None:
+            try:
+                book_id = repo.get_chapter(conn, job.target_id).book_id
+            except repo.RepoError:
+                book_id = None  # главу уже удалили
+        data["book_id"] = book_id
+        return data
+
     @app.get("/api/jobs")
     def list_jobs(active: bool = False):
         with app.state.db.connect() as conn:
-            items = [job.to_dict() for job in repo.list_jobs(conn, active_only=active)]
+            items = [_job_view(conn, job) for job in repo.list_jobs(conn, active_only=active)]
             return {
                 "jobs": items,
                 "active": sum(1 for j in items if j["status"] in ("pending", "running", "cancelling")),
-                # О завершённых интерфейс сообщит системным уведомлением.
-                "announce": [job.to_dict() for job in repo.unnotified_jobs(conn)],
+                # О завершённых интерфейс сообщит уведомлением.
+                "announce": [_job_view(conn, job) for job in repo.unnotified_jobs(conn)],
             }
 
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: int):
         """Одна задача — чтобы экран следил за своей, не читая всю очередь."""
         with app.state.db.connect() as conn:
-            return repo.get_job(conn, job_id).to_dict()
+            return _job_view(conn, repo.get_job(conn, job_id))
 
     @app.post("/api/books/{book_id}/markup")
     def markup_book(book_id: int, request: MarkupRequest):
@@ -980,6 +1216,35 @@ def create_app(
             repo.delete_pronunciation(conn, rule_id)
             return {"rules": repo.list_pronunciations(conn, book_id)}
 
+    @app.get("/api/pronunciations")
+    def all_pronunciations():
+        """Весь словарь: общие правила и правила каждой книги."""
+        with app.state.db.connect() as conn:
+            return {"rules": repo.all_pronunciations(conn)}
+
+    @app.put("/api/pronunciations")
+    def put_pronunciation(request: ScopedPronunciationRequest):
+        with app.state.db.connect() as conn:
+            repo.set_pronunciation(
+                conn, request.book_id, request.term, request.replacement,
+                whole_word=request.whole_word, case_sensitive=request.case_sensitive,
+            )
+            return {"rules": repo.all_pronunciations(conn)}
+
+    @app.delete("/api/pronunciations/{rule_id}")
+    def delete_any_pronunciation(rule_id: int):
+        with app.state.db.connect() as conn:
+            repo.delete_pronunciation(conn, rule_id)
+            return {"rules": repo.all_pronunciations(conn)}
+
+    # ---------------- студия ----------------
+
+    @app.get("/api/studio")
+    def studio():
+        """Книги с их состоянием: что разобрано, озвучено, где нет голосов."""
+        with app.state.db.connect() as conn:
+            return {"books": checks_mod.studio_overview(conn)}
+
     # Статика — последней: маршруты API объявлены выше и не перекрываются.
     from fastapi.staticfiles import StaticFiles
 
@@ -995,18 +1260,82 @@ def ready_line(port: int) -> str:
     return READY_PREFIX + json.dumps({"port": port, "library": str(paths.library_root())})
 
 
+ERROR_BROKEN_PIPE = 109  # Windows: другой конец канала закрыт
+STDIN_POLL_SECONDS = 0.5
+
+
 def _exit_when_stdin_closes(server) -> None:  # pragma: no cover — поток ОС
     """Родитель закрыл stdin — значит, окна больше нет.
 
     Надёжнее, чем ждать сигнала: срабатывает и когда оболочку убили, и когда
     она упала, а сиротой бэкенд держал бы базу и порт.
+
+    На Windows stdin не читаем, а раз в полсекунды заглядываем в канал. Пока
+    одна нить висит в ReadFile на канале, GetFileType на том же канале из
+    другой нити тоже ждёт — а его вызывает библиотека C при загрузке DLL
+    (OpenBLAS внутри numpy, который тянет torch). Блокирующее чтение здесь
+    вешало весь бэкенд на первой же озвучке: окно оставалось пустым.
     """
+    if sys.platform == "win32":
+        _watch_stdin_pipe(server)
+        return
     try:
         while sys.stdin.buffer.read(4096):
             pass
     except (OSError, ValueError):
         pass
     server.should_exit = True
+
+
+def _watch_stdin_pipe(server) -> None:  # pragma: no cover — только Windows
+    import ctypes
+    import msvcrt
+    import time
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.PeekNamedPipe.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+    ]
+    kernel32.PeekNamedPipe.restype = wintypes.BOOL
+    try:
+        fd = sys.stdin.fileno()
+        handle = msvcrt.get_osfhandle(fd)
+    except (OSError, ValueError, AttributeError):
+        return
+    available = wintypes.DWORD()
+    while not server.should_exit:
+        if not kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
+            if ctypes.get_last_error() == ERROR_BROKEN_PIPE:
+                break
+            return  # stdin — не канал (запуск из консоли): следить не за чем
+        if available.value:
+            # Нам в stdin ничего не пишут, но если напишут — не даём копиться.
+            # Данные уже есть, поэтому чтение не повиснет.
+            os.read(fd, available.value)
+        time.sleep(STDIN_POLL_SECONDS)
+    server.should_exit = True
+
+
+# Десктоп просит «любой свободный порт», но память окна (localStorage) привязана
+# к адресу вместе с портом: на новом порту каждый запуск забывал бы тему,
+# скорость плеера и фильтры библиотеки. Поэтому сначала пробуем постоянный.
+DESKTOP_PORT = 38417
+
+
+def bind_socket(host: str, port: int, prefer: int | None = None) -> socket.socket:
+    """Сокет на ``port``; при ``port=0`` — сперва на ``prefer``, если он свободен."""
+    for candidate in ([prefer] if port == 0 and prefer else []) + [port]:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind((host, candidate))
+            return sock
+        except OSError:
+            sock.close()
+            if candidate == port:
+                raise
+    raise OSError(f"не удалось занять порт {port}")  # pragma: no cover
 
 
 def serve(
@@ -1034,8 +1363,7 @@ def serve(
     app = create_app(db=db, base_url=base_url, token=token)
     # Незавершённые задачи возвращаются в очередь и продолжаются сами.
     app.state.queue.start()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind((host, port))
+    sock = bind_socket(host, port, prefer=DESKTOP_PORT if announce else None)
     sock.listen(128)
     actual_port = sock.getsockname()[1]
 

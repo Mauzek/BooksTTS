@@ -1,153 +1,457 @@
-// Карточка книги: название, главы, границы глав, озвучка, словарь произношений.
+// Книга: слева обложка, кнопки и сведения, справа — название, описание,
+// главы и роли. Сюда же добавляются новые главы.
 
-import { api, del, get, patch, post, put } from '../api.js';
+import { api, del, get, importChapters, patch, pickBookFiles, post } from '../api.js';
+import { editBookInfo, suggestAndEdit } from '../bookinfo.js';
+import { MOOD_PALETTES, avatar, cover, learnBooks, speakerName } from '../covers.js';
+import { busyPill, synthJobForBook, synthJobForChapter, watchActiveJobs } from '../jobs-state.js';
 import * as player from '../player.js';
-import { ask, confirmAction, el, emit, formatDuration, guard, icon, plural, toast } from '../ui.js';
+import { ask, confirmAction, dropdown, el, emit, formatDuration, formatSpan, guard, icon, plural, popupMenu, toast } from '../ui.js';
+import { ensureVoices } from '../voices.js';
 
 const PREVIEW_CHARS = 320;
+const DESCRIPTION_CHARS = 320;
+const BOOK_EXTENSIONS = ['.txt', '.epub', '.fb2', '.docx', '.pdf'];
+
+let preview = null;  // один голос за раз: новая проба глушит прошлую
+
+function playPreview(url) {
+  preview?.pause();
+  preview = new Audio(url);
+  preview.play().catch(() => toast('Не удалось проиграть пробу голоса', 'error'));
+}
+
+/**
+ * Размер названия под самое длинное слово: «Реинкарнация» целиком влезает в
+ * строку, а не рвётся посреди слова. Ширина буквы Unbounded — около 0,78 кегля.
+ */
+function titleSize(title, width = 640, largest = 44, smallest = 26) {
+  const longest = Math.max(1, ...String(title).split(/\s+/).map((word) => word.length));
+  return Math.max(smallest, Math.min(largest, Math.floor(width / (longest * 0.78))));
+}
+
+function when(stamp) {
+  if (!stamp) return '';
+  const date = new Date(`${stamp.replace(' ', 'T')}Z`);
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleDateString('ru', { day: 'numeric', month: 'long' });
+}
 
 export function render(view, bookId) {
   let alive = true;
   const openBoundaries = new Set();
+  let showFullDescription = false;
+  let current = null;           // последние данные книги — для обновления по задачам
+  const busyHosts = new Map();  // глава → место для кнопки или плашки «в очереди»
+  let heroBusy = null;          // место под плашку озвучки книги
   const page = el('div', { class: 'page' });
   view.replaceChildren(page);
 
   const load = guard(async () => {
-    const [data, rules] = await Promise.all([
+    const [data, cast, library] = await Promise.all([
       get(`/api/books/${bookId}`),
-      get(`/api/books/${bookId}/pronunciations`).catch(() => ({ rules: [] })),
+      get(`/api/books/${bookId}/cast`).catch(() => ({ speakers: [] })),
+      get('/api/library').catch(() => ({ folders: [] })),
     ]);
-    if (alive) draw(data, rules.rules);
+    if (alive) draw(data, cast.speakers, library);
   });
 
   const changed = () => emit('library-changed');
 
-  function draw({ book, chapters, speakers }, rules) {
-    const marked = chapters.filter((c) => c.segments).length;
-    const voiced = chapters.filter((c) => c.segments && c.voiced >= c.segments).length;
-    const chars = chapters.reduce((n, c) => n + c.n_chars, 0);
+  function folderPath(library, folderId) {
+    const walk = (folders, trail) => {
+      for (const folder of folders) {
+        const path = [...trail, folder];
+        if (folder.id === folderId) return path;
+        const deeper = walk(folder.folders, path);
+        if (deeper) return deeper;
+      }
+      return null;
+    };
+    return folderId ? walk(library.folders || [], []) || [] : [];
+  }
 
-    const title = el('h1', { class: 'editable', title: 'Переименовать' }, book.title);
+  /**
+   * Доля прослушанного по главам. Дослушанная глава отмечена в базе и
+   * остаётся прослушанной, даже если книгу начали сначала; текущая — по позиции.
+   */
+  function listened(chapters, playback) {
+    const out = new Map();
+    for (const chapter of chapters) {
+      if (chapter.listened_at) out.set(chapter.id, 1);
+      else if (playback && chapter.id === playback.chapter_id && chapter.duration_ms) {
+        out.set(chapter.id, Math.min(1, playback.position_ms / chapter.duration_ms));
+      } else out.set(chapter.id, 0);
+    }
+    return out;
+  }
+
+  const markupBook = (book, unmarked) => guard(async () => {
+    const ok = await confirmAction('Разметить книгу по ролям?',
+      `${plural(unmarked, 'глава без разметки уйдёт', 'главы без разметки уйдут', 'глав без разметки уйдут')} ` +
+      'в Claude по очереди. Уже размеченные главы и ручные правки не тронутся.', 'Разметить');
+    if (!ok) return;
+    const job = await post(`/api/books/${book.id}/markup`, {});
+    toast(`Задача добавлена: ${job.title}`, 'ok');
+    emit('jobs-changed');
+  });
+
+  const voiceAll = (book) => guard(async () => {
+    const state = await get(`/api/books/${book.id}/readiness`);
+    if (!state.marked) {
+      const ok = await confirmAction('Книгу пока нечего озвучивать',
+        'Сначала главы нужно разметить по ролям — Claude отметит, кто что говорит. Разметить сейчас?', 'Разметить');
+      if (ok) {
+        const job = await post(`/api/books/${book.id}/markup`, {});
+        toast(`Задача добавлена: ${job.title}`, 'ok');
+        emit('jobs-changed');
+      }
+      return;
+    }
+    // Голоса выбираются тут же, в окне, а не где-то в студии.
+    if (!(await ensureVoices(book.id))) return;
+    const ok = await confirmAction('Озвучить всю книгу?',
+      `${plural(state.marked, 'размеченная глава встанет', 'размеченные главы встанут', 'размеченных глав встанут')} в очередь. ` +
+      (state.unmarked.length ? `Неразмеченные (${state.unmarked.length}) пропустятся. ` : '') +
+      'Уже озвученные реплики не переозвучиваются, очередь переживёт закрытие приложения.',
+      'Озвучить');
+    if (!ok) return;
+    const job = await post(`/api/books/${book.id}/synthesize`, {});
+    toast(`Задача добавлена: ${job.title}`, 'ok');
+    emit('jobs-changed');
+  });
+
+  // ---------- обложка ----------
+
+  const uploadCover = (book) => guard(async () => {
+    const input = el('input', { type: 'file', accept: 'image/png,image/jpeg,image/webp,image/gif' });
+    input.onchange = guard(async () => {
+      const file = input.files[0];
+      if (!file) return;
+      await api(`/api/books/${book.id}/cover`, { method: 'PUT', body: file });
+      toast('Обложка обновлена', 'ok');
+      changed();
+    });
+    input.click();
+  });
+
+  const removeCover = (book) => guard(async () => {
+    const ok = await confirmAction('Убрать картинку обложки?',
+      'Вместо неё нарисуется обложка по жанру и настроению книги. Файл картинки удалится из библиотеки.', 'Убрать');
+    if (!ok) return;
+    await del(`/api/books/${book.id}/cover`);
+    toast('Картинка убрана — обложка нарисована заново', 'ok');
+    changed();
+  });
+
+  function coverMenu(book, anchor) {
+    popupMenu(anchor, [
+      ['Загрузить свою картинку…', uploadCover(book)],
+      ['Убрать картинку', removeCover(book), '', !book.cover_path],
+      '-',
+      ['Жанр и настроение — рисуют обложку…', guard(() => editBookInfo(book))],
+    ]);
+  }
+
+  // ---------- главы: добавить ----------
+
+  const addFromFile = (book, chapters) => guard(async () => {
+    const items = await pickBookFiles(BOOK_EXTENSIONS, { title: `Добавить главы в «${book.title}»` });
+    if (!items.length) return;
+    let added = 0;
+    for (const item of items) {
+      const name = item.path ? item.path.split(/[\\/]/).pop() : item.file.name;
+      try {
+        const result = await importChapters(book.id, item);
+        added += result.chapters.length;
+      } catch (error) {
+        toast(`${name}: ${error.message}`, 'error');
+      }
+    }
+    if (added) {
+      toast(`Добавлено: ${plural(added, 'глава', 'главы', 'глав')} — теперь в книге ${chapters.length + added}`, 'ok');
+      changed();
+    }
+  });
+
+  const addFromText = (book, chapters) => guard(async () => {
+    const result = await pasteChapterDialog(book, chapters);
+    if (!result) return;
+    toast(`Глава «${result.label}» добавлена`, 'ok');
+    changed();
+  });
+
+  function pasteChapterDialog(book, chapters) {
+    return new Promise((resolve) => {
+      const dialog = el('dialog', { class: 'paste-dialog' });
+      const close = (value) => { dialog.close(); dialog.remove(); resolve(value); };
+      const title = el('input', { placeholder: 'можно оставить пустым', 'aria-label': 'Название главы' });
+      const text = el('textarea', { rows: '12', placeholder: 'Вставьте текст главы. Если первая строка — «Глава 5. Дорога», она станет названием.', 'aria-label': 'Текст главы' });
+      const where = dropdown({
+        className: 'wide', label: 'Куда вставить', value: '',
+        options: [
+          { value: '', label: 'в конец книги' },
+          { value: '0', label: 'в начало книги' },
+          ...chapters.slice(0, -1).map((c) => ({ value: String(c.number), label: `после главы ${c.number}${c.title ? `. ${c.title}` : ''}` })),
+        ],
+      });
+      const error = el('p', { class: 'form-error', role: 'alert', hidden: true });
+      const count = el('span', { class: 'hint' }, '0 знаков');
+      text.addEventListener('input', () => { count.textContent = `${text.value.trim().length.toLocaleString('ru')} знаков`; });
+      const save = el('button', { class: 'primary lg', type: 'submit' }, icon('plus'), 'Добавить главу');
+      const form = el('form', {},
+        el('div', { class: 'dialog-head' },
+          el('div', { class: 'grow' }, el('h3', {}, 'Новая глава'), el('span', { class: 'hint' }, book.title)),
+          el('button', { type: 'button', class: 'round', 'aria-label': 'Закрыть', onclick: () => close(null) }, icon('x'))),
+        el('div', { class: 'field-grid' },
+          el('label', { class: 'field wide' }, el('span', { class: 'field-label' }, 'Название'), title),
+          el('label', { class: 'field wide' }, el('span', { class: 'field-label' }, 'Куда'), where)),
+        el('label', { class: 'field' }, el('span', { class: 'field-label' }, 'Текст'), text),
+        error,
+        el('div', { class: 'buttons' }, count, el('span', { class: 'grow' }),
+          el('button', { type: 'button', class: 'ghost lg', onclick: () => close(null) }, 'Отмена'), save));
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (!text.value.trim()) { error.textContent = 'Вставьте текст главы.'; error.hidden = false; text.focus(); return; }
+        save.disabled = true;
+        try {
+          const result = await post(`/api/books/${book.id}/chapters`, {
+            text: text.value, title: title.value.trim(), after: where.value === '' ? null : Number(where.value),
+          });
+          close(result.chapters[0]);
+        } catch (failure) {
+          error.textContent = failure.message;
+          error.hidden = false;
+          save.disabled = false;
+        }
+      });
+      dialog.addEventListener('cancel', (event) => { event.preventDefault(); close(null); });
+      dialog.append(form);
+      document.body.append(dialog);
+      dialog.showModal();
+      text.focus();
+    });
+  }
+
+  // ---------- отрисовка ----------
+
+  function infoChips(book) {
+    const chips = [
+      ...(book.genres || []).map((name) => el('span', { class: 'info-chip' }, name)),
+      ...(book.moods || []).map((name) => el('span', { class: 'info-chip' },
+        el('span', { class: 'mood-dot', style: { background: MOOD_PALETTES[name]?.[0] || 'var(--track)' }, 'aria-hidden': 'true' }), name)),
+    ];
+    return chips.length ? el('div', { class: 'info-chips' }, chips) : null;
+  }
+
+  /** Описание, метки и откуда они. Пусто — приглашение заполнить. */
+  function aboutSection(book) {
+    const hasInfo = book.description || book.tags?.length || book.genres?.length || book.moods?.length || book.year || book.country;
+    if (!hasInfo) {
+      return el('section', { class: 'about-empty' },
+        el('span', { class: 'about-icon', 'aria-hidden': 'true' }, icon('sparkles', { className: 'big' })),
+        el('div', { class: 'grow' },
+          el('b', {}, 'Расскажите о книге'),
+          el('span', { class: 'hint' }, 'Жанр, настроение, описание и метки. По жанру и настроению нарисуется обложка, по меткам удобно искать. ИИ может заполнить всё сам по названию книги.')),
+        el('div', { class: 'about-actions' },
+          el('button', { class: 'surface', onclick: guard(() => editBookInfo(book)) }, 'Вручную'),
+          el('button', { class: 'primary', onclick: guard(() => suggestAndEdit(book)) }, icon('sparkles'), 'Заполнить с помощью ИИ')));
+    }
+    const text = book.description || '';
+    const long = text.length > DESCRIPTION_CHARS;
+    const shown = long && !showFullDescription ? `${text.slice(0, DESCRIPTION_CHARS).replace(/\s+\S*$/, '')}…` : text;
+    const source = book.info_source === 'ai'
+      ? el('span', {
+        class: 'ai-pill', title: `Описание, жанр и метки подобрал ИИ${book.info_at ? ` ${when(book.info_at)}` : ''}. Проверьте и поправьте, если что-то не так.`,
+      }, icon('sparkles', { size: 13 }), 'подобрано ИИ')
+      : null;
+    return el('section', { class: 'section about' },
+      el('div', { class: 'section-head' }, el('h2', {}, 'О книге'), source, el('span', { class: 'grow' }),
+        book.info_source === 'ai' ? null
+          : el('button', { class: 'ghost sm accent', onclick: guard(() => suggestAndEdit(book)), title: 'Жанр, настроение, описание и метки — по названию книги' },
+            icon('sparkles', { size: 14 }), 'Дополнить с помощью ИИ'),
+        el('button', { class: 'ghost sm', onclick: guard(() => editBookInfo(book)) }, icon('pencil', { size: 14 }), 'Изменить')),
+      el('div', { class: 'card-box about-card' },
+        text ? el('p', { class: 'about-text' }, shown,
+          long ? el('button', {
+            class: 'link-button', onclick: () => { showFullDescription = !showFullDescription; load(); },
+          }, showFullDescription ? ' свернуть' : ' читать дальше') : null)
+          : el('p', { class: 'hint' }, 'Описания пока нет — его можно добавить кнопкой «Изменить».'),
+        book.tags?.length ? el('div', { class: 'tag-list' }, book.tags.map((tag) => el('a', {
+          class: 'tag', href: `#/library?tag=${encodeURIComponent(tag)}`, title: 'Показать книги с этой меткой',
+        }, tag))) : null));
+  }
+
+  function draw({ book, chapters, playback }, speakers, library) {
+    current = { book, chapters };
+    learnBooks([book]);
+    busyHosts.clear();
+    const voiced = chapters.filter((c) => c.duration_ms).length;
+    const unmarked = chapters.filter((c) => !c.segments).length;
+    const heard = chapters.filter((c) => c.listened_at).length;
+    const duration = chapters.reduce((n, c) => n + (c.duration_ms || 0), 0);
+    const progress = listened(chapters, playback);
+    const folders = folderPath(library, book.folder_id);
+
+    const title = el('h1', { class: 'book-title editable', title: 'Переименовать', tabindex: '0' }, book.title);
+    title.style.fontSize = `${titleSize(book.title)}px`;
     title.onclick = guard(async () => {
       const value = await ask('Название книги', { value: book.title });
       if (value) { await patch(`/api/books/${book.id}`, { title: value }); changed(); }
     });
-    const author = el('div', { class: 'editable muted', title: 'Изменить автора' },
+    const author = el('button', { class: 'book-author link-button', title: 'Изменить автора' },
       book.author || 'автор не указан');
     author.onclick = guard(async () => {
       const value = await ask('Автор', { value: book.author, allowEmpty: true });
       if (value !== null) { await patch(`/api/books/${book.id}`, { author: value }); changed(); }
     });
 
-    const voiceAll = el('button', { class: 'primary' }, icon('mic'), 'Озвучить книгу');
-    voiceAll.onclick = guard(async () => {
-      // Сначала — готова ли книга. Задача, упавшая на каждой главе из-за
-      // одной роли без голоса, объясняет проблему хуже, чем этот список.
-      let state = await get(`/api/books/${book.id}/readiness`);
-      if (!state.ready) {
-        const choice = await readinessDialog(book, state);
-        if (choice === 'voices') { location.hash = `#/voices?book=${book.id}`; return; }
-        if (choice !== 'auto') return;
-        const result = await post(`/api/books/${book.id}/cast/auto`, { engine: 'silero' });
-        toast(`Голоса подобраны: ${plural(result.assigned.length, 'роль', 'роли', 'ролей')}`, 'ok');
-        state = await get(`/api/books/${book.id}/readiness`);
-        if (!state.ready) return readinessDialog(book, state);
-      } else {
-        const ok = await confirmAction('Озвучить всю книгу?',
-          `${plural(state.marked, 'размеченная глава встанет', 'размеченные главы встанут', 'размеченных глав встанут')} в очередь. ` +
-          'Уже озвученные реплики пропустятся, очередь переживёт закрытие приложения.',
-          'Озвучить');
+    const main = voiced
+      ? el('button', { class: 'primary xl book-main-action', onclick: guard(() => player.playBook(book.id)) },
+        icon('play', { className: 'filled' }), playback?.position_ms || heard ? 'Продолжить' : 'Слушать')
+      : el('button', { class: 'primary xl book-main-action', onclick: voiceAll(book) }, icon('mic', { className: 'big' }), 'Озвучить книгу');
+    const exportButton = el('button', { class: 'round xl surface', 'aria-label': 'Экспорт в m4b или mp3', title: 'Экспорт в m4b или mp3' },
+      icon('download', { className: 'big' }));
+    exportButton.onclick = () => exportDialog(book, voiced, chapters.length);
+    const more = el('button', { class: 'round xl surface', 'aria-label': 'Ещё', title: 'Ещё' }, icon('ellipsis', { className: 'big' }));
+    more.onclick = () => popupMenu(more, [
+      ['Озвучить книгу', voiceAll(book), '', !chapters.some((c) => c.segments) || Boolean(synthJobForBook(book.id))],
+      [`Разметить по ролям${unmarked ? ` (${unmarked})` : ''}`, markupBook(book, unmarked), '', !unmarked],
+      ['Открыть в студии — по шагам', () => { location.hash = `#/studio/book/${book.id}`; }],
+      ['Голоса ролей', () => { location.hash = `#/studio/book/${book.id}/voices`; }],
+      ['Словарь произношений', () => { location.hash = `#/studio/pronunciation?book=${book.id}`; }],
+      '-',
+      ['О книге: жанр, настроение, метки…', guard(() => editBookInfo(book))],
+      ['Добавить главы из файла…', addFromFile(book, chapters)],
+      ['Вставить главу текстом…', addFromText(book, chapters)],
+      ['Экспорт…', () => exportDialog(book, voiced, chapters.length)],
+      ['Загрузить разметку из файла…', importMarkup(book)],
+      '-',
+      ['Удалить книгу', guard(async () => {
+        const ok = await confirmAction(`Удалить книгу «${book.title}»?`,
+          'Удалятся главы, разметка, озвучка и копия файла в библиотеке. Отменить это нельзя.');
         if (!ok) return;
-      }
-      const job = await post(`/api/books/${book.id}/synthesize`, {});
-      toast(`Задача добавлена: ${job.title}`, 'ok');
-      emit('jobs-changed');
+        await del(`/api/books/${book.id}`);
+        location.hash = '#/library';
+        changed();
+      }), 'danger'],
+    ]);
+
+    const coverButton = el('button', { class: 'cover-edit', 'aria-label': 'Сменить обложку', title: 'Сменить обложку' },
+      icon('image'), el('span', {}, 'Обложка'));
+    coverButton.onclick = (event) => { event.stopPropagation(); coverMenu(book, coverButton); };
+    heroBusy = el('div', { class: 'book-busy' });
+
+    const facts = [
+      ['Автор', book.author || '—'],
+      book.year ? ['Год', String(book.year)] : null,
+      book.country ? ['Страна', book.country] : null,
+      ['Главы', voiced === chapters.length ? `${chapters.length}, все озвучены` : `${chapters.length}, озвучено ${voiced}`],
+      duration ? ['Звучит', formatSpan(duration)] : null,
+      heard ? ['Прослушано', `${heard} из ${chapters.length}`] : null,
+      speakers.length ? ['Роли', String(speakers.length)] : null,
+    ].filter(Boolean);
+
+    const side = el('aside', { class: 'book-side' },
+      el('div', { class: 'book-cover' }, cover(book), coverButton),
+      el('div', { class: 'book-actions' }, main, exportButton, more),
+      heroBusy,
+      el('dl', { class: 'book-facts' }, facts.flatMap(([label, value]) => [el('dt', {}, label), el('dd', {}, value)])));
+
+    const crumbs = el('nav', { class: 'crumbs', 'aria-label': 'Где лежит книга' },
+      el('a', { href: '#/library' }, 'Библиотека'),
+      folders.flatMap((folder) => [el('span', { 'aria-hidden': 'true' }, '›'), el('a', { href: `#/library?folder=${folder.id}` }, folder.name)]));
+
+    const roleCards = speakers.map((speaker) => {
+      const voice = speaker.voice;
+      return el('div', { class: 'role-card' },
+        avatar(speaker.name, speaker.slot, 'lg'),
+        el('div', { class: 'who' },
+          el('b', {}, speakerName(speaker.name)),
+          el('span', {}, plural(speaker.count, 'реплика', 'реплики', 'реплик'))),
+        voice
+          ? el('button', {
+            title: speaker.sample ? `Прозвучит реплика из книги: «${speaker.sample}»` : 'Послушать голос',
+            onclick: guard(async (event) => {
+              const button = event.currentTarget;
+              button.classList.add('busy');
+              try {
+                // Проба — реплика этого персонажа с его темпом и тоном; готовая
+                // берётся из кеша, новая записывается за секунду-две.
+                const result = await post(`/api/voices/${voice.id}/preview`, {
+                  text: speaker.sample || '', rate: speaker.cast?.rate ?? 1,
+                  pitch: speaker.cast?.pitch ?? 1, volume: speaker.cast?.volume ?? 1,
+                });
+                playPreview(result.url);
+              } finally {
+                button.classList.remove('busy');
+              }
+            }),
+          }, icon('play', { className: 'filled', size: 12 }), voice.display_name || voice.voice_key)
+          : el('button', {
+            class: 'caution-button', onclick: guard(async () => { if (await ensureVoices(book.id)) load(); }),
+          }, icon('mic', { size: 14 }), 'Выбрать голос'));
     });
 
-    const unmarkedCount = chapters.filter((c) => !c.segments).length;
-    const markupAll = unmarkedCount
-      ? el('button', {
-        title: 'Разметить по ролям все главы без разметки — по очереди',
-        onclick: guard(async () => {
-          const ok = await confirmAction('Разметить книгу по ролям?',
-            `${plural(unmarkedCount, 'глава без разметки уйдёт', 'главы без разметки уйдут', 'глав без разметки уйдут')} ` +
-            'в Claude по очереди. Уже размеченные главы и ручные правки не тронутся.',
-            'Разметить');
-          if (!ok) return;
-          const job = await post(`/api/books/${book.id}/markup`, {});
-          toast(`Задача добавлена: ${job.title}`, 'ok');
-          emit('jobs-changed');
-        }),
-      }, icon('wand-sparkles'), `Разметить книгу (${unmarkedCount})`)
-      : null;
+    const addButton = el('button', { class: 'surface sm', 'aria-haspopup': 'menu' }, icon('plus', { size: 16 }), 'Добавить главы');
+    addButton.onclick = () => popupMenu(addButton, [
+      ['Из файла — txt, fb2, epub, docx, pdf…', addFromFile(book, chapters)],
+      ['Вставить текстом…', addFromText(book, chapters)],
+    ]);
 
-    // Опасное действие — иконкой в углу, а не в одном ряду с главными кнопками.
-    const remove = el('button', { class: 'ghost icon-button danger', title: 'Удалить книгу' },
-      icon('trash-2'));
-    remove.onclick = guard(async () => {
-      const ok = await confirmAction(`Удалить книгу «${book.title}»?`,
-        'Удалятся главы, разметка, озвучка и копия файла в библиотеке. Отменить это нельзя.');
-      if (!ok) return;
-      await del(`/api/books/${book.id}`);
-      location.hash = '#/';
-      changed();
-    });
-
-    const firstUnmarked = chapters.find((c) => !c.segments) || chapters[0];
-
-    page.replaceChildren(
-      el('div', { class: 'book-head' },
-        book.cover_path
-          ? el('img', { class: 'cover', src: `/api/books/${book.id}/cover`, alt: '' })
-          : el('div', { class: 'cover' }, icon('book-open', { className: 'huge' })),
-        el('div', { class: 'grow' },
-          el('div', { class: 'title-row' }, title, remove),
-          author,
-          el('div', { class: 'stats' },
-            el('span', {}, el('b', {}, plural(chapters.length, 'глава', 'главы', 'глав'))),
-            el('span', {}, el('b', {}, chars.toLocaleString('ru')), ' симв.'),
-            speakers.length
-              ? el('span', {}, el('b', {}, plural(speakers.length, 'роль', 'роли', 'ролей')))
-              : null),
-          el('div', { class: 'book-progress' },
-            meter('Разметка', marked, chapters.length),
-            meter('Озвучка', voiced, chapters.length)),
-          el('div', { class: 'row' },
-            markupAll,
-            firstUnmarked
-              ? el('a', {
-                class: 'button', href: `#/chapter/${firstUnmarked.id}/edit`,
-                title: firstUnmarked.segments ? '' : `Откроется «${firstUnmarked.label}» — первая глава без разметки`,
-              }, icon('type'), 'Редактор разметки')
-              : null,
-            el('a', { class: 'button', href: `#/voices?book=${book.id}` }, icon('mic'), 'Голоса ролей'),
-            voiced
-              ? el('button', {
-                title: 'Играть озвученные главы подряд',
-                onclick: guard(() => player.playBook(book.id)),
-              }, icon('play'), 'Слушать книгу')
-              : null,
-            voiceAll))),
-      el('h2', {}, 'Главы'),
-      el('p', { class: 'hint' },
-        'Границы глав можно поправить: раскройте «Границы» и начните новую главу ',
-        'с нужного абзаца или склейте главу со следующей.'),
-      el('div', { class: 'list' },
-        chapters.map((chapter, index) => chapterRow(chapter, index === chapters.length - 1))),
-      el('h2', {}, 'Экспорт'),
-      exportSection(book, voiced > 0),
-      el('h2', {}, 'Словарь произношений'),
-      el('p', { class: 'hint' },
-        'Имена и термины, которые синтез читает неправильно. Замена подставляется ',
-        'только в озвучку — в тексте главы остаётся исходное написание. ',
-        'Правка словаря переозвучит лишь те реплики, где слово встречается.'),
-      pronunciations(book, rules),
-    );
+    page.replaceChildren(el('div', { class: 'book-page' },
+      side,
+      el('div', { class: 'book-main' },
+        el('header', { class: 'book-head' }, crumbs, title, author, infoChips(book)),
+        aboutSection(book),
+        el('section', { class: 'section' },
+          el('div', { class: 'section-head' }, el('h2', {}, 'Главы'),
+            el('span', { class: 'hint' }, plural(chapters.length, 'глава', 'главы', 'глав')),
+            el('span', { class: 'grow' }), addButton),
+          el('div', { class: 'chapter-rows' },
+            chapters.map((chapter, index) => chapterRow(chapter, index === chapters.length - 1, progress.get(chapter.id), chapters.length)))),
+        speakers.length
+          ? el('section', { class: 'section' },
+            el('div', { class: 'section-head' }, el('h2', {}, 'Кто читает'), el('a', { href: `#/studio/book/${book.id}/voices` }, 'настроить голоса')),
+            el('div', { class: 'role-cards' }, roleCards))
+          : null)));
+    drawBusy();
   }
 
-  function chapterRow(chapter, isLast) {
+  /**
+   * Состояние озвучки в строках глав и у кнопки книги. Обновляется на месте
+   * по опросу очереди — страница не перерисовывается целиком.
+   */
+  function drawBusy() {
+    if (!current) return;
+    const { book, chapters } = current;
+    const bookJob = synthJobForBook(book.id);
+    const heroKey = bookJob ? `${bookJob.id}:${bookJob.status}:${Math.round((bookJob.progress || 0) * 100)}` : '';
+    if (heroBusy && heroBusy.dataset.key !== heroKey) {
+      heroBusy.dataset.key = heroKey;
+      heroBusy.replaceChildren(bookJob ? busyPill(bookJob) : '');
+    }
+    // Задача всей книги идёт по главам подряд: первая неозвученная — сейчас, остальные ждут.
+    const waiting = chapters.filter((c) => c.segments && !c.duration_ms);
+    for (const chapter of chapters) {
+      const host = busyHosts.get(chapter.id);
+      if (!host) continue;
+      let job = synthJobForChapter(chapter.id, book.id);
+      if (job && job.kind === 'book') {
+        if (chapter.duration_ms || !chapter.segments) job = null;
+        else if (job.status === 'running' && waiting[0] !== chapter) job = { ...job, status: 'pending' };
+      }
+      const key = job ? `${job.id}:${job.status}:${Math.round((job.progress || 0) * 100)}` : '';
+      if (host.dataset.key === key) continue;
+      host.dataset.key = key;
+      host.replaceChildren(job ? busyPill(job) : host.idle);
+    }
+  }
+
+  function chapterRow(chapter, isLast, share = 0, total = 1) {
     const open = openBoundaries.has(chapter.id);
-    const panel = el('div', { class: 'paragraphs', hidden: !open });
+    const panel = el('div', { class: 'paragraphs chapter-extra', hidden: !open });
+    const done = Boolean(chapter.listened_at);
+    const bookId = current.book.id;
 
     const rename = guard(async () => {
       const value = await ask('Название главы',
@@ -165,7 +469,20 @@ export function render(view, bookId) {
       toast('Главы склеены', 'ok');
       changed();
     });
+    const remove = guard(async () => {
+      const ok = await confirmAction(`Удалить «${chapter.label}»?`,
+        'Удалятся текст главы, её разметка и озвучка. Следующие главы сдвинутся на её место. Отменить это нельзя.');
+      if (!ok) return;
+      await del(`/api/chapters/${chapter.id}`);
+      toast('Глава удалена', 'ok');
+      changed();
+    });
+    const markListened = (value) => guard(async () => {
+      await api(`/api/chapters/${chapter.id}/listened`, { method: 'PUT', body: { listened: value } });
+      load();
+    });
     const voice = guard(async () => {
+      if (!(await ensureVoices(bookId, { chapterId: chapter.id }))) return;
       const job = await post(`/api/chapters/${chapter.id}/synthesize`, {});
       toast(`Задача добавлена: ${job.title}`, 'ok');
       emit('jobs-changed');
@@ -176,35 +493,60 @@ export function render(view, bookId) {
       load();
     };
 
-    const row = el('div', { class: 'list-row' },
-      el('span', { class: 'num' }, chapter.number),
-      el('div', { class: 'title' },
-        el('div', {}, chapter.title || el('span', { class: 'muted' }, `Глава ${chapter.number}`)),
-        el('div', { class: 'sub chips' },
-          el('span', {}, `${chapter.n_chars.toLocaleString('ru')} симв.`),
-          statusChip(chapter))),
-      el('div', { class: 'row' },
-        el('div', { class: 'actions' },
-          chapter.duration_ms
-            ? el('button', {
-              class: 'icon-button', title: 'Слушать эту главу',
-              onclick: guard(() => player.playChapter(chapter.id)),
-            }, icon('play'))
-            : null,
-          el('a', { class: 'button', href: `#/chapter/${chapter.id}` }, icon('headphones'), 'Читать'),
-          el('a', { class: 'button', href: `#/chapter/${chapter.id}/edit` }, icon('type'), 'Разметка'),
-          chapter.segments
-            ? el('button', { onclick: voice, title: 'Поставить в очередь озвучки' }, icon('mic'), 'Озвучить')
-            : null,
-          el('button', { class: 'icon-button', onclick: rename, title: 'Переименовать главу' },
-            icon('pencil')),
-          el('button', { onclick: toggle, 'aria-expanded': String(open) },
-            icon('scissors'), open ? 'Скрыть границы' : 'Границы'),
-          isLast
-            ? null
-            : el('button', { class: 'icon-button', onclick: merge, title: 'Склеить со следующей' },
-              icon('merge')))),
-    );
+    let sub;
+    let subClass = 'sub';
+    if (chapter.errors) {
+      sub = `не озвучено реплик: ${chapter.errors}`;
+      subClass = 'sub warn';
+    } else if (chapter.duration_ms) {
+      sub = formatDuration(chapter.duration_ms) + (done ? ' · прослушана'
+        : share > 0 ? ` · прослушано ${Math.round(share * 100)}%` : '');
+    } else if (chapter.segments && chapter.voiced) {
+      sub = `озвучено ${chapter.voiced} из ${chapter.segments} реплик`;
+    } else if (chapter.segments) {
+      sub = `разобрана по ролям · ${plural(chapter.segments, 'реплика', 'реплики', 'реплик')}`;
+    } else {
+      sub = `ещё не разобрана по ролям · ${chapter.n_chars.toLocaleString('ru')} знаков`;
+    }
+
+    // Прослушанная — галочка вместо номера; начатая — кольцо заполняется.
+    const ring = el('span', {
+      class: `ring${chapter.duration_ms ? '' : ' idle'}${done ? ' done' : ''}`,
+      'aria-label': done ? `Глава ${chapter.number}, прослушана` : `Глава ${chapter.number}`,
+    }, el('span', {}, chapter.number), done ? el('span', { class: 'ring-badge', 'aria-hidden': 'true' }, icon('check', { size: 11 })) : null);
+    ring.style.setProperty('--p', String(done ? 100 : Math.round(share * 100)));
+
+    const primary = chapter.duration_ms
+      ? el('button', { class: 'round invert', 'aria-label': `Слушать: ${chapter.label}`, title: 'Слушать', onclick: guard(() => player.playChapter(chapter.id)) },
+        icon('play', { className: 'filled', size: 14 }))
+      : chapter.segments
+        ? el('button', { onclick: voice, title: 'Поставить в очередь озвучки' }, icon('mic'), 'Озвучить')
+        : el('a', { class: 'button', href: `#/chapter/${chapter.id}/edit` }, icon('wand-sparkles'), 'Разметить');
+    // Место под кнопку: пока глава в очереди, там плашка с её состоянием.
+    const host = el('span', { class: 'row-primary' }, primary);
+    host.idle = primary;
+    busyHosts.set(chapter.id, host);
+    const busy = () => Boolean(synthJobForChapter(chapter.id, bookId));
+    const moreButton = el('button', { class: 'round ghost', 'aria-label': `Действия: ${chapter.label}`, title: 'Действия' }, icon('ellipsis'));
+    moreButton.onclick = () => popupMenu(moreButton, [
+      ['Читать вместе', () => { location.hash = `#/chapter/${chapter.id}`; }],
+      ['Разметка по ролям', () => { location.hash = `#/chapter/${chapter.id}/edit`; }],
+      [busy() ? 'Озвучить главу — уже в очереди' : 'Озвучить главу', voice, '', !chapter.segments || busy()],
+      done ? ['Снять отметку «прослушана»', markListened(false)] : ['Отметить прослушанной', markListened(true)],
+      '-',
+      ['Переименовать', rename],
+      [open ? 'Скрыть границы глав' : 'Поправить границы глав', toggle],
+      ['Склеить со следующей', merge, '', isLast],
+      '-',
+      ['Удалить главу', remove, 'danger', total <= 1],
+    ]);
+
+    const row = el('div', { class: `chapter-row${done ? ' listened' : ''}` },
+      ring,
+      el('div', { class: 'info' },
+        el('span', { class: 'name' }, chapter.title || `Глава ${chapter.number}`),
+        el('span', { class: subClass }, sub)),
+      el('div', { class: 'row-actions' }, host, moreButton));
     if (open) loadParagraphs(chapter, panel);
     return el('div', {}, row, panel);
   }
@@ -239,185 +581,85 @@ export function render(view, bookId) {
     host.replaceChildren(...rows);
   });
 
-  function meter(label, done, total) {
-    const share = total ? done / total : 0;
-    return el('div', { class: 'meter' },
-      el('div', { class: 'meter-head' },
-        el('span', {}, label),
-        el('b', {}, `${done} из ${total}`)),
-      el('div', { class: `progress wide${share >= 1 ? ' full' : ''}` },
-        el('i', { style: { width: `${share * 100}%` } })));
-  }
 
-  /** Состояние главы одним значком: не размечена → размечена → озвучена. */
-  function statusChip(chapter) {
-    if (chapter.errors) {
-      return el('span', { class: 'chip-status warn' }, icon('triangle-alert', { size: 12 }),
-        `ошибок: ${chapter.errors}`);
-    }
-    if (chapter.duration_ms) {
-      return el('span', { class: 'chip-status ok' }, icon('headphones', { size: 12 }),
-        `озвучена · ${formatDuration(chapter.duration_ms)}`);
-    }
-    if (chapter.segments && chapter.voiced) {
-      return el('span', { class: 'chip-status partial' }, icon('mic', { size: 12 }),
-        `озвучено ${chapter.voiced} из ${chapter.segments}`);
-    }
-    if (chapter.segments) {
-      return el('span', { class: 'chip-status marked' }, icon('type', { size: 12 }),
-        `размечена · ${plural(chapter.segments, 'реплика', 'реплики', 'реплик')}`);
-    }
-    return el('span', { class: 'chip-status' }, 'не размечена');
-  }
-
-  /** Что мешает озвучке, и выбор, как это исправить. */
-  function readinessDialog(book, state) {
-    return new Promise((resolve) => {
-      const dialog = el('dialog', { class: 'wide' });
-      const done = (value) => { dialog.close(); dialog.remove(); resolve(value); };
-      const list = (items, render) => el('ul', { class: 'plain-list' }, items.map((item) => el('li', {}, render(item))));
-
-      dialog.append(
-        el('h3', {}, 'Книгу пока нельзя озвучить'),
-        state.marked === 0
-          ? el('p', {}, 'В книге нет ни одной размеченной главы. Сначала разметьте её по ролям.')
-          : null,
-        state.missing_voice.length
-          ? el('div', {},
-            el('p', {}, `У ${plural(state.missing_voice.length, 'роли', 'ролей', 'ролей')} нет голоса:`),
-            list(state.missing_voice, (m) => [
-              el('b', {}, m.speaker === 'narrator' ? 'рассказчик' : m.speaker),
-              el('span', { class: 'hint' }, ` — ${plural(m.lines, 'реплика', 'реплики', 'реплик')}`)]))
-          : null,
-        state.unavailable_voice.length
-          ? el('div', {},
-            el('p', {}, 'Голос назначен, но пропал из каталога движка:'),
-            list(state.unavailable_voice, (u) => [el('b', {}, u.speaker), ` — ${u.voice} (${u.engine})`]))
-          : null,
-        state.unmarked.length && state.marked
-          ? el('p', { class: 'hint' },
-            `${plural(state.unmarked.length, 'глава не размечена', 'главы не размечены', 'глав не размечены')} — их озвучка пропустит.`)
-          : null,
-        el('div', { class: 'buttons' },
-          el('button', { onclick: () => done(null) }, 'Отмена'),
-          state.marked
-            ? el('button', { onclick: () => done('voices') }, icon('mic'), 'Назначить вручную')
-            : null,
-          state.marked && state.missing_voice.length
-            ? el('button', { class: 'primary', onclick: () => done('auto') },
-              icon('wand-sparkles'), 'Подобрать голоса и озвучить')
-            : null));
-      dialog.addEventListener('cancel', (event) => { event.preventDefault(); done(null); });
-      document.body.append(dialog);
-      dialog.showModal();
+  const importMarkup = (book) => guard(async () => {
+    const input = el('input', { type: 'file', accept: '.json' });
+    input.onchange = guard(async () => {
+      const file = input.files[0];
+      if (!file) return;
+      const result = await api(`/api/books/${book.id}/import-markup`, {
+        method: 'POST', body: await file.text(),
+        headers: { 'content-type': 'application/json' },
+      });
+      const chapters = result.chapters.length;
+      toast(`Разметка наложена на ${plural(chapters, 'главу', 'главы', 'глав')}` +
+        (result.lost_segments ? `, не нашлось реплик: ${result.lost_segments}` : ''),
+        result.lost_segments ? 'error' : 'ok');
+      changed();
     });
-  }
+    input.click();
+  });
 
-  function exportSection(book, hasAudio) {
-    const files = el('div', { class: 'list' });
-    const run = (kind, label) => guard(async () => {
+  /** Экспорт: формат карточками, куда ляжет файл, что уже выгружено. */
+  function exportDialog(book, voiced, total) {
+    const dialog = el('dialog', { class: 'export-dialog', 'aria-labelledby': 'export-title' });
+    const close = () => { dialog.close(); dialog.remove(); };
+    const option = (kind, iconName, title, text, disabled = false) => el('label', { class: `export-option${disabled ? ' off' : ''}` },
+      el('input', { type: 'radio', name: 'export-kind', value: kind, disabled, checked: !disabled && kind === (voiced ? 'm4b' : 'json') }),
+      el('span', { class: 'export-icon' }, icon(iconName, { className: 'big' })),
+      el('span', {}, el('b', {}, title), el('span', { class: 'hint' }, text)));
+    const noAudio = !voiced;
+    const files = el('div', { class: 'export-files' }, el('span', { class: 'hint' }, 'Смотрю, что уже выгружено…'));
+    const where = el('div', { class: 'export-where' });
+    const run = el('button', { class: 'primary lg' }, icon('download', { className: 'big' }), 'Экспортировать');
+    run.onclick = guard(async () => {
+      const kind = dialog.querySelector('input[name="export-kind"]:checked')?.value;
+      if (!kind) return;
       const job = await post(`/api/books/${book.id}/export`, { kind });
-      toast(`${label}: задача добавлена`, 'ok');
+      toast(`Задача добавлена: ${job.title}. Файл появится в папке экспорта.`, 'ok');
       emit('jobs-changed');
-      return job;
+      close();
     });
 
-    const folder = el('p', { class: 'hint' });
+    // append у DOM печатает null текстом — пустые части отбрасываем.
+    dialog.append(...[
+      el('div', { class: 'dialog-head' },
+        el('div', { class: 'grow' }, el('h3', { id: 'export-title' }, 'Экспорт книги'),
+          el('span', { class: 'hint' }, `${book.title} · озвучено ${voiced} из ${total} ${total === 1 ? 'главы' : 'глав'}`)),
+        el('button', { class: 'round', 'aria-label': 'Закрыть', onclick: close }, icon('x'))),
+      el('div', { class: 'export-options' },
+        option('m4b', 'file-audio', 'Аудиокнига m4b', 'Один файл с главами и обложкой — для плееров аудиокниг и телефона.', noAudio),
+        option('mp3', 'folder', 'Папка mp3', 'Файл на каждую главу — откроется в любом плеере.', noAudio),
+        option('json', 'file-json', 'Разметка JSON', 'Роли и голоса без звука — чтобы сохранить работу или перенести на другой компьютер.')),
+      noAudio ? el('p', { class: 'hint' }, 'Звука пока нет — сначала озвучьте главы. Разметку сохранить можно уже сейчас.')
+        : voiced < total ? el('p', { class: 'hint' }, `Неозвученные главы (${total - voiced}) в файл не попадут.`) : null,
+      where, files,
+      el('div', { class: 'buttons' }, el('button', { class: 'ghost lg', onclick: close }, 'Отмена'), run),
+    ].filter(Boolean));
+    dialog.addEventListener('cancel', (event) => { event.preventDefault(); close(); });
+    dialog.addEventListener('click', (event) => { if (event.target === dialog) close(); });
+    document.body.append(dialog);
+    dialog.showModal();
 
-    const loadFiles = guard(async () => {
-      const data = await get(`/api/books/${book.id}/exports`);
-      if (!alive) return;
-      // Папка одна на все файлы — показываем её сверху, а не в каждой строке.
-      folder.replaceChildren(data.files.length ? `Папка: ${data.dir}` : '');
+    get(`/api/books/${book.id}/exports`).then((data) => {
+      const copy = el('button', { class: 'surface sm' }, 'Скопировать путь');
+      copy.onclick = guard(async () => { await navigator.clipboard.writeText(data.dir); toast('Путь скопирован', 'ok'); });
+      where.replaceChildren(el('code', { class: 'path grow' }, data.dir), copy);
       files.replaceChildren(...(data.files.length
-        ? data.files.map((file) => el('div', { class: 'list-row' },
-          el('span', { class: 'num' }, icon(file.name.endsWith('.json') ? 'file-json' : 'file-audio')),
-          el('div', { class: 'title' }, el('a', { href: file.url, download: file.name }, file.name)),
-          el('span', { class: 'hint' },
-            `${(file.size / 1048576).toFixed(1).replace('.', ',')} МБ`)))
-        : [el('div', { class: 'list-row' },
-          el('span', { class: 'num' }),
-          el('div', { class: 'title muted' }, 'Пока ничего не выгружено.'),
-          el('span'))]));
-    });
-
-    const importMarkup = guard(async () => {
-      const input = el('input', { type: 'file', accept: '.json' });
-      input.onchange = guard(async () => {
-        const file = input.files[0];
-        if (!file) return;
-        const result = await api(`/api/books/${book.id}/import-markup`, {
-          method: 'POST', body: await file.text(),
-          headers: { 'content-type': 'application/json' },
-        });
-        const chapters = result.chapters.length;
-        toast(`Разметка наложена на ${plural(chapters, 'главу', 'главы', 'глав')}` +
-          (result.lost_segments ? `, не нашлось реплик: ${result.lost_segments}` : ''),
-          result.lost_segments ? 'error' : 'ok');
-        changed();
-      });
-      input.click();
-    });
-
-    loadFiles();
-    return el('div', {},
-      el('p', { class: 'hint' },
-        'm4b — один файл с оглавлением и обложкой, его понимают плееры аудиокниг. ',
-        'Разметку можно передать другому человеку: она привязана к тексту, а не к номерам строк.'),
-      el('div', { class: 'row' },
-        el('button', {
-          class: 'primary', disabled: !hasAudio, title: hasAudio ? '' : 'Сначала озвучьте главы',
-          onclick: run('m4b', 'm4b'),
-        }, icon('download'), 'Собрать m4b'),
-        el('button', {
-          disabled: !hasAudio, onclick: run('mp3', 'mp3'),
-        }, icon('file-audio'), 'Разложить mp3'),
-        el('button', { onclick: run('json', 'Разметка') }, icon('file-json'), 'Сохранить разметку'),
-        el('button', { onclick: importMarkup }, icon('wand-sparkles'), 'Загрузить разметку…')),
-      folder, files);
-  }
-
-  function pronunciations(book, rules) {
-    const term = el('input', { placeholder: 'Как написано' });
-    const replacement = el('input', { placeholder: 'Как читать' });
-    const wholeWord = el('input', { type: 'checkbox', checked: true });
-    const add = el('button', { class: 'primary' }, 'Добавить');
-    add.onclick = guard(async () => {
-      if (!term.value.trim()) return toast('Впишите слово', 'error');
-      await put(`/api/books/${book.id}/pronunciations`, {
-        term: term.value.trim(),
-        replacement: replacement.value.trim(),
-        whole_word: wholeWord.checked,
-      });
-      term.value = replacement.value = '';
-      toast('Добавлено в словарь', 'ok');
-      load();
-    });
-
-    return el('div', {},
-      rules.length
-        ? el('div', { class: 'list' }, rules.map((rule) => el('div', { class: 'list-row rules-row' },
-          el('div', { class: 'term' }, rule.term),
-          el('div', {}, rule.replacement || el('span', { class: 'muted' }, '— без замены —'),
-            rule.whole_word ? null : el('span', { class: 'sub' }, ' (и внутри слов)')),
-          el('button', {
-            class: 'danger', onclick: guard(async () => {
-              await del(`/api/books/${book.id}/pronunciations/${rule.id}`);
-              load();
-            }),
-          }, 'Удалить'))))
-        : null,
-      el('div', { class: 'rules-form' },
-        term, replacement,
-        el('label', { class: 'row hint' }, wholeWord, 'слово целиком'),
-        add));
+        ? [el('span', { class: 'hint' }, 'Уже выгружено:'), ...data.files.map((file) => el('a', { class: 'export-file', href: file.url, download: file.name },
+          icon(file.name.endsWith('.json') ? 'file-json' : 'file-audio', { size: 16 }), el('span', { class: 'grow' }, file.name),
+          el('span', { class: 'hint' }, `${(file.size / 1048576).toFixed(1).replace('.', ',')} МБ`)))]
+        : []));
+    }).catch(() => files.replaceChildren());
   }
 
   const onChange = () => load();
   window.addEventListener('library-changed', onChange);
+  const unwatchJobs = watchActiveJobs(drawBusy);
   load();
   return () => {
     alive = false;
+    unwatchJobs();
     window.removeEventListener('library-changed', onChange);
   };
 }

@@ -37,6 +37,26 @@ log = logging.getLogger("audiobook.synth")
 
 ATTEMPTS = 3
 BACKOFF = (1.0, 3.0)  # пауза перед второй и третьей попыткой
+PAUSE_MS = 300  # «реплика» из одних знаков («?», «…») звучит короткой паузой
+
+
+def speakable(text: str) -> bool:
+    """Есть ли что произносить: хоть одна буква или цифра."""
+    return any(ch.isalnum() for ch in text or "")
+
+
+def silence_wav(ms: int = PAUSE_MS, rate: int = 24000) -> bytes:
+    """Тишина нужной длины в WAV — вместо «озвучки» знаков препинания."""
+    import io
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(b"\0\0" * int(rate * ms / 1000))
+    return buffer.getvalue()
 
 Conn = sqlite3.Connection
 Progress = Callable[[int, int], None]
@@ -68,7 +88,7 @@ def plan(conn: Conn, chapter_id: int, force: bool = False) -> dict[str, Any]:
     """Что предстоит озвучить в главе — без единого обращения к движку."""
     chapter = repo.get_chapter(conn, chapter_id)
     cast = _cast_for(conn, chapter.book_id)
-    rules = pronounce.compile_rules(repo.list_pronunciations(conn, chapter.book_id))
+    rules = pronounce.compile_rules(repo.rules_for_book(conn, chapter.book_id))
     segments = repo.list_segments(conn, chapter_id)
 
     missing = sorted({
@@ -205,6 +225,14 @@ def synthesize_chapter(
     def report() -> None:
         if on_progress:
             on_progress(done, total)
+
+    # Реплика без букв («?», «…» — осколок после разделения) движку не по
+    # зубам: Silero падает, Qwen выдумывает звук. Такая реплика — пауза.
+    for task in [t for t in tasks if not speakable(t[2])]:
+        store(task, silence_wav(), "wav")
+        done += 1
+        report()
+    tasks = [t for t in tasks if speakable(t[2])]
 
     # Движки, которые умеют пачками (Qwen), получают реплики пачками: одна
     # фраза почти не нагружает видеокарту, пачка из восьми идёт в пять раз

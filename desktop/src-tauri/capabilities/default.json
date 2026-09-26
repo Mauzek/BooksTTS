@@ -13,6 +13,7 @@
     "dialog:allow-save",
     "allow-backend-status",
     "allow-restart-backend",
+    "allow-notify",
     "allow-app-version",
     "allow-check-update",
     "allow-install-update"

@@ -32,7 +32,12 @@ KIND_BOOK = "book"  # вся книга
 KIND_FOLDER = "folder"  # все книги папки
 KIND_EXPORT = "export"  # m4b, mp3 или разметка
 KIND_MARKUP_BOOK = "markup_book"  # разметка всех глав книги
-KINDS = (KIND_MARKUP, KIND_SYNTHESIS, KIND_BOOK, KIND_FOLDER, KIND_EXPORT, KIND_MARKUP_BOOK)
+KIND_QWEN_MOVE = "qwen_move"  # перенос папки Qwen на другой диск
+KIND_PREVIEWS = "previews"  # образцы голосов для каталога
+KINDS = (
+    KIND_MARKUP, KIND_SYNTHESIS, KIND_BOOK, KIND_FOLDER, KIND_EXPORT, KIND_MARKUP_BOOK,
+    KIND_QWEN_MOVE, KIND_PREVIEWS,
+)
 
 EXPORT_TITLES = {"m4b": "Экспорт m4b", "mp3": "Экспорт mp3", "json": "Экспорт разметки"}
 
@@ -163,6 +168,8 @@ class JobQueue:
             KIND_FOLDER: self._run_folder,
             KIND_EXPORT: self._run_export,
             KIND_MARKUP_BOOK: self._run_markup_book,
+            KIND_QWEN_MOVE: self._run_qwen_move,
+            KIND_PREVIEWS: self._run_previews,
         }
         try:
             result = handlers[job.kind](job)
@@ -283,6 +290,41 @@ class JobQueue:
 
     def _run_chapter(self, job: Job) -> dict[str, Any]:
         return self._chapter(job.target_id, job, self._parallelism())
+
+    def _run_previews(self, job: Job) -> dict[str, Any]:
+        """Образцы голосов: каталог слушается сразу, без ожидания на каждом голосе."""
+        from . import catalog
+
+        with self.db.connect() as conn:
+            return catalog.make_previews(
+                conn, on_progress=self._progress(conn, job.id),
+                should_stop=lambda: self._stop.is_set() or _is_cancelling(conn, job.id),
+            )
+
+    def _run_qwen_move(self, job: Job) -> dict[str, Any]:
+        """Перенос папки Qwen: гигабайты копируются минутами — поэтому задачей."""
+        from pathlib import Path
+
+        from .engines import qwen
+
+        target = Path(job.params["target"])
+        with self.db.connect() as conn:
+            report = self._progress(conn, job.id)
+
+            def progress(done: int, total: int) -> None:
+                # В мегабайтах: в счётчике задачи целые числа, а байтов слишком много.
+                report(done // 1_048_576, max(1, total // 1_048_576))
+
+            result = qwen.relocate(
+                Path(job.params["source"]), target, on_progress=progress,
+                should_stop=lambda: self._stop.is_set() or _is_cancelling(conn, job.id),
+            )
+            if not result.get("cancelled"):
+                beside = qwen.suggested_home()
+                # Рядом с программой приложение найдёт Qwen само — настройку не пишем.
+                keep = "" if beside and Path(result["home"]) == beside.resolve() else result["home"]
+                repo.set_setting(conn, "engine.qwen.home", keep)
+        return result
 
     def _run_export(self, job: Job) -> dict[str, Any]:
         """Экспорт идёт задачей: m4b длинной книги собирается минутами."""

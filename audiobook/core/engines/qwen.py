@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import sys
 import threading
 import uuid
@@ -63,10 +65,91 @@ WORKER = Path(__file__).with_name("_qwen_worker.py")
 USES_EMOTION = True
 
 
-def default_home() -> Path:
-    """Папка Qwen по умолчанию: вне проекта и вне OneDrive."""
+UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\BookTTS"
+HOME_NAME = "qwen"  # папка рядом с установленной программой
+
+
+def legacy_home() -> Path:
+    """Где Qwen лежал раньше: %LOCALAPPDATA%\BookTTS-qwen на системном диске."""
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
     return Path(base) / "BookTTS-qwen"
+
+
+def program_dir() -> Path | None:
+    """Папка установленного приложения — рядом с ней держим тяжёлые данные.
+
+    В собранном приложении это папка над backend\booktts-backend.exe; при
+    запуске из исходников — место установки из реестра, если приложение стоит.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent.parent
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as key:
+            location = str(winreg.QueryValueEx(key, "InstallLocation")[0]).strip().strip('"')
+    except OSError:
+        return None
+    return Path(location) if location and Path(location).is_dir() else None
+
+
+def suggested_home() -> Path | None:
+    """Куда предлагать перенести Qwen: рядом с программой."""
+    folder = program_dir()
+    return folder / HOME_NAME if folder else None
+
+
+def default_home() -> Path:
+    """Папка Qwen, если в настройках не указана своя.
+
+    Рядом с программой, если Qwen там уже есть; иначе — прежнее место, где он
+    мог остаться от старых версий; для новой установки — снова рядом с программой.
+    """
+    beside = suggested_home()
+    if beside and python_in(beside).is_file():
+        return beside
+    legacy = legacy_home()
+    if python_in(legacy).is_file():
+        return legacy
+    return beside or legacy
+
+
+def store_python(home: Path) -> bool:
+    """Окружение построено на Python из Microsoft Store.
+
+    Такой Python не может создавать файлы в %LOCALAPPDATA% — Windows
+    перенаправляет запись, и numba внутри qwen-tts бесконечно пытается создать
+    временный файл. Окружение нужно держать на другом диске или вне AppData.
+    """
+    try:
+        config = (home / "venv" / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "WindowsApps" in config or "PythonSoftwareFoundation" in config
+
+
+def inside_appdata(path: Path) -> bool:
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        return False
+    try:
+        path.resolve().relative_to(Path(base).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def scratch_dir() -> Path:
+    """Куда рабочий процесс кладёт готовые WAV и кеш numba.
+
+    Временная папка Windows не перенаправляется даже для Python из Store:
+    файл, записанный рабочим, приложение увидит там же.
+    """
+    folder = Path(tempfile.gettempdir()) / "booktts-qwen"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
 def python_in(home: Path) -> Path:
@@ -128,6 +211,9 @@ class _Worker:
             return
         flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
         environment = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        # Кеш numba — во временную папку: рядом с библиотеками (по умолчанию)
+        # Python из Store писать не может и зависает в бесконечных попытках.
+        environment["NUMBA_CACHE_DIR"] = str(scratch_dir() / "numba")
         if self.hf_home is not None:
             # Модель лежит рядом с окружением — например, вынесена на другой диск.
             environment["HF_HOME"] = str(self.hf_home)
@@ -184,7 +270,9 @@ class QwenEngine:
         options = options or {}
         # Папка Qwen: окружение (venv) и, если есть, кеш модели (huggingface).
         # Целиком переносится на другой диск — достаточно поменять настройку.
-        self.home = Path(options.get("engine.qwen.home") or default_home()).expanduser()
+        # Ссылки раскрываем: папку, перенесённую на другой диск через junction
+        # в AppData, Python из Store иначе видит «через» AppData и не может в неё писать.
+        self.home = Path(options.get("engine.qwen.home") or default_home()).expanduser().resolve()
         self.python = Path(options.get("engine.qwen.python") or python_in(self.home))
         hf_home = self.home / "huggingface"
         # Своей папки с моделью нет — общий кеш Hugging Face, как раньше:
@@ -232,10 +320,15 @@ class QwenEngine:
         return (language or "ru").lower()[:2] in {"ru", "en", "zh", "ja", "ko", "de", "fr", "pt", "es", "it"}
 
     def status(self) -> dict[str, Any]:
-        base = {"name": self.name, "title": self.title, "needs_key": False, "variant": self.model}
+        base = {"name": self.name, "title": self.title, "needs_key": False, "variant": self.model,
+                "home": str(self.home)}
         if not self.installed():
             return {**base, "ready": False, "installed": False,
                     "detail": f"не найден в {self.home}: нужно окружение с CUDA и модель (~9 ГБ)"}
+        if store_python(self.home) and inside_appdata(self.home):
+            return {**base, "ready": False, "installed": True, "needs_move": True,
+                    "detail": "папка Qwen лежит в AppData, а Python из Microsoft Store не может туда писать — "
+                              "перенесите её в «Настройках» (Озвучка → Папка Qwen3-TTS)"}
         worker = _WORKERS.get(self._key())
         if worker and worker.alive():
             detail = f"модель загружена, {worker.device}"
@@ -265,11 +358,7 @@ class QwenEngine:
             if item["voice_key"] not in known:
                 raise EngineFatalError(f"у Qwen3-TTS нет голоса {item['voice_key']!r}")
 
-        from ... import paths
-
-        scratch = paths.cache_dir() / "qwen"
-        scratch.mkdir(parents=True, exist_ok=True)
-        targets = [scratch / f"{uuid.uuid4().hex}.wav" for _ in items]
+        targets = [scratch_dir() / f"{uuid.uuid4().hex}.wav" for _ in items]
         answer = self._worker().request({"items": [
             {"text": item["text"].strip(), "speaker": item["voice_key"], "language": LANGUAGE,
              "instruct": INSTRUCTIONS.get(item.get("emotion", ""), ""), "out": str(target)}
@@ -278,10 +367,56 @@ class QwenEngine:
         try:
             if not answer.get("ok"):
                 raise EngineError(f"Qwen3-TTS: {answer.get('error', 'без причины')}")
-            return [(target.read_bytes(), "wav") for target in targets]
+            results = [(target.read_bytes(), "wav") for target in targets]
         finally:
             for target in targets:
                 target.unlink(missing_ok=True)
+        # Модель иногда «заговаривается»: вместо фразы — десяток секунд
+        # бормотания. Такую фразу пишем заново, по одной.
+        for index, item in enumerate(items):
+            for _attempt in range(RUNAWAY_RETRIES):
+                if not runaway(results[index][0], item["text"]):
+                    break
+                retry = self._single(item)
+                if wav_seconds(retry[0]) < wav_seconds(results[index][0]):
+                    results[index] = retry
+        return results
+
+    def _single(self, item: dict[str, Any]) -> tuple[bytes, str]:
+        target = scratch_dir() / f"{uuid.uuid4().hex}.wav"
+        answer = self._worker().request({"items": [
+            {"text": item["text"].strip(), "speaker": item["voice_key"], "language": LANGUAGE,
+             "instruct": INSTRUCTIONS.get(item.get("emotion", ""), ""), "out": str(target)}
+        ]})
+        try:
+            if not answer.get("ok"):
+                raise EngineError(f"Qwen3-TTS: {answer.get('error', 'без причины')}")
+            return target.read_bytes(), "wav"
+        finally:
+            target.unlink(missing_ok=True)
+
+
+RUNAWAY_RETRIES = 2
+# Русская речь — около 14 знаков в секунду. Втрое медленнее и с запасом
+# на паузы — это уже не чтение фразы, а сорвавшаяся генерация.
+SECONDS_PER_CHAR = 0.14
+SLACK_SECONDS = 2.0
+
+
+def wav_seconds(data: bytes) -> float:
+    import io
+    import wave
+
+    try:
+        with wave.open(io.BytesIO(data)) as handle:
+            return handle.getnframes() / float(handle.getframerate() or 1)
+    except (wave.Error, EOFError):
+        return 0.0
+
+
+def runaway(data: bytes, text: str) -> bool:
+    """Звук слишком длинный для такой фразы — модель сорвалась."""
+    return wav_seconds(data) > len((text or "").strip()) * SECONDS_PER_CHAR + SLACK_SECONDS
 
 
 def engine(options: dict[str, Any] | None = None) -> QwenEngine:
@@ -295,3 +430,72 @@ def shutdown() -> None:
         _WORKERS.clear()
     for worker in workers:
         worker.stop()
+
+
+# --------------------------------------------------------------------------
+# Перенос папки Qwen
+# --------------------------------------------------------------------------
+
+RESERVE_BYTES = 512 * 1024 * 1024  # запас на диске сверх размера папки
+
+
+def folder_size(folder: Path) -> int:
+    return sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
+
+
+def _existing_parent(path: Path) -> Path:
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path
+
+
+def relocate(source: Path, target: Path, *, on_progress=None, should_stop=None) -> dict[str, Any]:
+    """Перенести папку Qwen (окружение и модель) целиком, например на другой диск.
+
+    Сначала копия, потом проверка, и только потом удаление старой папки: если
+    перенос прервать, рабочая копия остаётся на старом месте.
+    """
+    source, target = Path(source).resolve(), Path(target).resolve()
+    if not python_in(source).is_file():
+        raise EngineError(f"в {source} нет окружения Qwen — переносить нечего")
+    if target == source:
+        raise EngineError("Qwen уже лежит в этой папке")
+    if source in target.parents:
+        raise EngineError("нельзя перенести папку внутрь неё самой")
+    if target.exists() and any(target.iterdir()):
+        raise EngineError(f"папка {target} не пуста — выберите пустую или новую")
+
+    files = [f for f in source.rglob("*") if f.is_file()]
+    total = sum(f.stat().st_size for f in files)
+    free = shutil.disk_usage(_existing_parent(target)).free
+    if free < total + RESERVE_BYTES:
+        gb = lambda n: f"{n / 1024 ** 3:.1f}".replace(".", ",")  # noqa: E731
+        raise EngineError(f"на диске {target.anchor} свободно {gb(free)} ГБ, а нужно {gb(total)} ГБ")
+
+    shutdown()  # модель держит файлы открытыми
+    target.mkdir(parents=True, exist_ok=True)
+    for folder in (d for d in source.rglob("*") if d.is_dir()):
+        (target / folder.relative_to(source)).mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for index, file in enumerate(files):
+        if should_stop and should_stop():
+            shutil.rmtree(target, ignore_errors=True)
+            return {"cancelled": True, "home": str(source)}
+        destination = target / file.relative_to(source)
+        shutil.copy2(file, destination)
+        copied += file.stat().st_size
+        if on_progress and (index % 50 == 0 or index == len(files) - 1):
+            on_progress(copied, total)
+
+    if not python_in(target).is_file() or folder_size(target) < total:
+        raise EngineError("копия получилась неполной — старая папка оставлена на месте")
+    shutil.rmtree(source, ignore_errors=True)
+    # Ссылка из AppData на старую папку теперь ведёт в никуда — убираем её.
+    link = legacy_home()
+    if link != source and os.path.realpath(link) == str(source):
+        try:
+            os.rmdir(link)
+        except OSError:
+            pass
+    left = source.exists()
+    return {"home": str(target), "bytes": total, "left_behind": str(source) if left else ""}

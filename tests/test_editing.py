@@ -6,6 +6,7 @@ import pytest
 
 from audiobook.core import editing, repo
 from audiobook.core.models import Segment, segment_hash
+from audiobook.core.parser import PARAGRAPH_SEP
 
 SESSION = "тестовая-сессия"
 
@@ -100,9 +101,20 @@ def test_empty_range_is_an_error(conn, marked):
         editing.assign_range(conn, SESSION, marked.id, 10, 10, "Аглая")
 
 
-def test_range_outside_any_segment_is_an_error(conn, marked):
-    with pytest.raises(editing.EditError, match="не попало"):
+def test_range_outside_the_text_is_an_error(conn, marked):
+    with pytest.raises(editing.EditError, match="нет текста"):
         editing.assign_range(conn, SESSION, marked.id, 99000, 99100, "Аглая")
+
+
+def test_text_the_markup_skipped_becomes_new_lines(conn, chapter):
+    """Кусок, не попавший ни в одну реплику, можно выделить и назначить роль."""
+    first, second = chapter.text.split(PARAGRAPH_SEP)[:2]
+    end = chapter.text.index(second) + len(second)
+    editing.assign_range(conn, SESSION, chapter.id, 0, end, "Аглая")
+    segments = repo.list_segments(conn, chapter.id)
+    assert [(s.speaker, s.text) for s in segments] == [("Аглая", first), ("Аглая", second)]
+    assert all(s.is_manual for s in segments)
+    assert chapter.text[segments[1].char_start:segments[1].char_end] == second
 
 
 def test_range_drops_stale_audio(conn, marked):
@@ -143,7 +155,7 @@ def test_split_marks_both_halves_manual(conn, marked):
 @pytest.mark.parametrize("offset", [0, 10_000])
 def test_split_outside_the_text_is_an_error(conn, marked, offset):
     target = repo.list_segments(conn, marked.id)[0]
-    with pytest.raises(editing.EditError, match="нечего делить"):
+    with pytest.raises(editing.EditError, match="делить нечего"):
         editing.split_segment(conn, SESSION, marked.id, target.id, offset)
 
 
@@ -190,6 +202,20 @@ def test_rename_across_the_book(conn, marked):
     repo.replace_segments(conn, other.id, [Segment(speaker="Велимир", text="Внук.")])
     editing.rename_speaker(conn, SESSION, marked.id, "Велимир", "Веля", whole_book=True)
     assert speakers(conn, other.id) == ["Веля"]
+
+
+def test_merging_into_narrator_keeps_the_narrator_voice(conn, marked):
+    """«Отдать реплики рассказчику» не должно менять голос рассказчика."""
+    from audiobook.core.models import Voice
+
+    aidar = repo.upsert_voice(conn, Voice(engine="silero", voice_key="aidar"))
+    baya = repo.upsert_voice(conn, Voice(engine="silero", voice_key="baya"))
+    repo.set_cast(conn, marked.book_id, "narrator", aidar.id)
+    repo.set_cast(conn, marked.book_id, "Велимир", baya.id)
+    editing.rename_speaker(conn, SESSION, marked.id, "Велимир", "narrator", whole_book=True)
+    cast = repo.cast_map(conn, marked.book_id)
+    assert cast["narrator"].voice_id == aidar.id
+    assert "Велимир" not in cast
 
 
 def test_rename_merges_into_an_existing_speaker(conn, marked):

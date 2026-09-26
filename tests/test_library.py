@@ -43,6 +43,58 @@ def test_v1_library_is_migrated_without_losing_data(tmp_path):
         assert [hit["kind"] for hit in repo.search(conn, "ежики")] == ["chapter"]
 
 
+def test_v3_dictionary_survives_and_can_hold_shared_rules(tmp_path):
+    """Версия 4 пересобирает словарь: старые правила книг не теряются."""
+    path = tmp_path / "v3.db"
+    old = sqlite3.connect(path)
+    old.executescript(db_mod.SCHEMA + "PRAGMA user_version = 1;")
+    for target in (2, 3):
+        old.executescript(f"BEGIN;\n{db_mod.MIGRATIONS[target]}\nPRAGMA user_version = {target};\nCOMMIT;")
+    old.execute("INSERT INTO book (title) VALUES ('Книга')")
+    old.execute("INSERT INTO pronunciation (book_id, term, replacement) VALUES (1, 'Терех', 'Т+ерех')")
+    old.commit()
+    old.close()
+
+    database = db_mod.Database(path).setup()
+    with database.connect() as conn:
+        assert repo.list_pronunciations(conn, 1)[0]["replacement"] == "Т+ерех"
+        repo.set_pronunciation(conn, None, "т. е.", "то есть")
+        repo.set_pronunciation(conn, None, "т. е.", "то есть")  # повтор — не дубль
+        assert [r["term"] for r in repo.list_pronunciations(conn, None)] == ["т. е."]
+
+
+def test_v4_progress_becomes_listened_marks(tmp_path):
+    """Версия 5: главы до текущей и дослушанная текущая получают галочку."""
+    path = tmp_path / "v4.db"
+    old = sqlite3.connect(path)
+    old.executescript(db_mod.SCHEMA + "PRAGMA user_version = 1;")
+    for target in (2, 3, 4):
+        old.executescript(f"BEGIN;\n{db_mod.MIGRATIONS[target]}\nPRAGMA user_version = {target};\nCOMMIT;")
+    old.execute("INSERT INTO book (title) VALUES ('Книга')")
+    for number in (1, 2, 3):
+        old.execute(
+            "INSERT INTO chapter (book_id, number, audio_path, duration_ms) VALUES (1, ?, ?, 60000)",
+            (number, f"audio/{number}.mp3"),
+        )
+    old.execute("INSERT INTO playback (book_id, chapter_id, position_ms) VALUES (1, 2, 59000)")
+    old.commit()
+    old.close()
+
+    database = db_mod.Database(path).setup()
+    with database.connect() as conn:
+        heard = [bool(c.listened_at) for c in repo.list_chapters(conn, 1)]
+        assert heard == [True, True, False]
+        assert repo.get_book(conn, 1).genres == []
+
+
+def test_book_rule_beats_the_shared_one(conn, marked):
+    repo.set_pronunciation(conn, None, "колокол", "общий")
+    repo.set_pronunciation(conn, None, "т. е.", "то есть")
+    repo.set_pronunciation(conn, marked.book_id, "Колокол", "книжный")
+    rules = {r["term"]: r["replacement"] for r in repo.rules_for_book(conn, marked.book_id)}
+    assert rules == {"т. е.": "то есть", "Колокол": "книжный"}
+
+
 def test_setup_twice_is_harmless(db):
     db.setup()
     with db.connect() as conn:

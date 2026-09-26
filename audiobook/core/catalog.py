@@ -94,11 +94,15 @@ def save_settings(conn: Conn, values: dict[str, Any]) -> dict[str, Any]:
         if problem:
             # Иначе ошибка всплыла бы через полчаса, посреди озвучки книги.
             raise repo.InvalidOperation(problem)
+    before = settings(conn).get("preview.text")
     for key, value in values.items():
         if key in DEFAULT_SETTINGS or key.startswith(("engine.", "anthropic.")):
             if isinstance(value, str):
                 value = value.strip()
             repo.set_setting(conn, key, value)
+    if settings(conn).get("preview.text") != before:
+        # Образцы звучат прежней фразой — пусть перезапишутся новой.
+        conn.execute("UPDATE voice SET preview_path = NULL")
     return settings(conn)
 
 
@@ -169,11 +173,97 @@ def catalog(
         conn, engine=engine, gender=gender, language=language,
         search=search, available_only=available_only,
     )
-    return [{**voice.to_dict(), "preview_url": preview_url(voice)} for voice in voices]
+    # В скольких книгах голос уже звучит — чтобы не менять его вслепую.
+    used = dict(conn.execute(
+        'SELECT voice_id, COUNT(DISTINCT book_id) FROM "cast" WHERE voice_id IS NOT NULL GROUP BY voice_id'
+    ).fetchall())
+    return [{**voice.to_dict(), "preview_url": preview_url(voice), "books": used.get(voice.id, 0)}
+            for voice in voices]
 
 
 def preview_url(voice: Voice) -> str:
     return f"/previews/{Path(voice.preview_path).name}" if voice.preview_path else ""
+
+
+def _has_preview(voice: Voice) -> bool:
+    if not voice.preview_path:
+        return False
+    try:
+        return paths.absolute(voice.preview_path).is_file()
+    except paths.PathsError:
+        return False
+
+
+def missing_previews(conn: Conn) -> list[Voice]:
+    """Голоса без готового образца — у бесплатных движков, которые готовы.
+
+    Платные (ElevenLabs) заранее не озвучиваем: каждый образец стоит денег.
+    """
+    free = {
+        status["name"] for status in engines_status(conn)
+        if status.get("ready") and not status.get("needs_key")
+    }
+    return [
+        voice for voice in repo.list_voices(conn, available_only=True)
+        if voice.engine in free and not _has_preview(voice)
+    ]
+
+
+def make_previews(conn: Conn, on_progress=None, should_stop=None) -> dict[str, Any]:
+    """Озвучить образцы фразой из настроек — чтобы голос слушался сразу.
+
+    Движок, умеющий пачки (Qwen), получает голоса пачкой: по одному Qwen
+    пишет фразу секунд двадцать, а пачкой из восьми — почти так же быстро,
+    как одну.
+    """
+    voices = missing_previews(conn)
+    options = settings(conn)
+    phrase = str(options.get("preview.text") or "").strip()
+    total, done = len(voices), 0
+    failed: list[dict[str, str]] = []
+    broken: set[str] = set()  # движок сломался — остальные его голоса не мучаем
+
+    def report() -> None:
+        if on_progress:
+            on_progress(done + len(failed), total)
+
+    by_engine: dict[str, list[Voice]] = {}
+    for voice in voices:
+        by_engine.setdefault(voice.engine, []).append(voice)
+    for name, group in by_engine.items():
+        try:
+            engine = get_engine(name, options)
+        except EngineError as exc:
+            broken.add(name)
+            failed.extend({"voice": v.key, "error": str(exc)} for v in group)
+            report()
+            continue
+        batch = getattr(engine, "batch_size", 1) if hasattr(engine, "synthesize_batch") else 1
+        for start in range(0, len(group), max(1, batch)):
+            if should_stop and should_stop():
+                return {"cancelled": True, "done": done}
+            chunk = group[start:start + max(1, batch)]
+            try:
+                if batch > 1 and len(chunk) > 1:
+                    results = engine.synthesize_batch(
+                        [{"text": phrase, "voice_key": v.voice_key, "emotion": ""} for v in chunk])
+                    for voice, (data, extension) in zip(chunk, results):
+                        digest = _preview_digest(voice, phrase)
+                        stored = _store_preview(conn, voice, phrase, digest, data, extension)
+                        repo.set_voice_preview(conn, voice.id, paths.relative(stored))
+                        done += 1
+                else:
+                    for voice in chunk:
+                        preview(conn, voice.id)
+                        done += 1
+            except (CatalogError, EngineError) as exc:
+                broken.add(name)
+                failed.extend({"voice": v.key, "error": str(exc)} for v in chunk)
+                report()
+                break
+            report()
+    return {"done": done, "failed": failed,
+            "error": f"не удалось: {', '.join(sorted(broken))}" if broken else None}
 
 
 # --------------------------------------------------------------------------
@@ -194,9 +284,7 @@ def preview(conn: Conn, voice_id: int, text: str = "", rate: float = 1.0,
     if not phrase:
         raise CatalogError("нечего прослушивать: пустая фраза")
 
-    digest = hashlib.sha1(
-        f"{voice.key}|{rate:g}|{pitch:g}|{volume:g}|{phrase}".encode("utf-8")
-    ).hexdigest()[:16]
+    digest = _preview_digest(voice, phrase, rate, pitch, volume)
     paths.ensure_layout()
     existing = next(paths.previews_dir().glob(f"{voice.engine}-{digest}.*"), None)
     if existing is None:
@@ -207,11 +295,7 @@ def preview(conn: Conn, voice_id: int, text: str = "", rate: float = 1.0,
             )
         except EngineError as exc:
             raise CatalogError(str(exc)) from exc
-        existing = paths.previews_dir() / f"{voice.engine}-{digest}.{extension}"
-        temporary = existing.with_suffix(existing.suffix + ".part")
-        temporary.write_bytes(data)
-        temporary.replace(existing)  # в каталог попадает только целый файл
-        repo.record_usage(conn, voice.engine, "preview", chars=len(phrase))
+        existing = _store_preview(conn, voice, phrase, digest, data, extension)
 
     relative = paths.relative(existing)
     is_default = not text or phrase == str(options.get("preview.text") or "")
@@ -219,6 +303,21 @@ def preview(conn: Conn, voice_id: int, text: str = "", rate: float = 1.0,
         repo.set_voice_preview(conn, voice.id, relative)
     return {"voice_id": voice.id, "path": relative, "url": f"/previews/{existing.name}",
             "text": phrase}
+
+
+def _preview_digest(voice: Voice, phrase: str, rate: float = 1.0, pitch: float = 1.0, volume: float = 1.0) -> str:
+    return hashlib.sha1(
+        f"{voice.key}|{rate:g}|{pitch:g}|{volume:g}|{phrase}".encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _store_preview(conn: Conn, voice: Voice, phrase: str, digest: str, data: bytes, extension: str) -> Path:
+    target = paths.previews_dir() / f"{voice.engine}-{digest}.{extension}"
+    temporary = target.with_suffix(target.suffix + ".part")
+    temporary.write_bytes(data)
+    temporary.replace(target)  # в каталог попадает только целый файл
+    repo.record_usage(conn, voice.engine, "preview", chars=len(phrase))
+    return target
 
 
 # --------------------------------------------------------------------------
@@ -231,18 +330,21 @@ def cast_view(conn: Conn, book_id: int) -> dict[str, Any]:
     book = repo.get_book(conn, book_id)
     assigned = repo.cast_map(conn, book_id)
     genders = speaker_genders(conn, book_id)
+    slots = repo.role_slots(conn, book_id)
     speakers = []
     for name, count in repo.book_speakers(conn, book_id).items():
         entry = assigned.get(name)
         speakers.append({
             "name": name,
             "count": count,
+            "slot": slots.get(name, 0),
             "is_narrator": name == NARRATOR,
             "gender": genders.get(name, {}).get("gender", ""),
             "gender_source": genders.get(name, {}).get("source", ""),
             "cast": entry.to_dict() if entry else None,
             "voice": entry.voice.to_dict() if entry and entry.voice else None,
             "preview_url": preview_url(entry.voice) if entry and entry.voice else "",
+            "sample": repo.speaker_sample(conn, book_id, name),
         })
     return {"book": book.to_dict(), "speakers": speakers}
 
@@ -305,7 +407,8 @@ def auto_assign(conn: Conn, book_id: int, engine: str = "silero",
 
     result = []
     for speaker in speakers:
-        if speaker in assigned and not overwrite:
+        # Строка без голоса остаётся после «Снять голос» — такую роль заполняем.
+        if not overwrite and speaker in assigned and assigned[speaker].voice_id:
             continue
         gender = genders.get(speaker, {}).get("gender", "")
         if speaker == NARRATOR:

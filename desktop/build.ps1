@@ -1,7 +1,9 @@
 ﻿# Сборка установщика на этой машине — те же шаги, что в CI (.github/workflows/release.yml).
 #
-# Всё тяжёлое (бэкенд с torch, target/ Rust) собирается в %LOCALAPPDATA%\BookTTS-build:
-# проект лежит в OneDrive, и гигабайты артефактов там синхронизировались бы.
+# Всё тяжёлое (бэкенд с torch, target/ Rust) собирается вне проекта: он лежит в
+# OneDrive, и гигабайты артефактов там синхронизировались бы. Папка — из
+# переменной BOOKTTS_BUILD_DIR (например, на несистемном диске), иначе
+# %LOCALAPPDATA%\BookTTS-build.
 #
 # Ключ подписи обновлений: %USERPROFILE%\.tauri\booktts.key, пароль к нему —
 # в хранилище паролей Windows (служба BookTTS-release).
@@ -11,7 +13,8 @@ param([switch]$SkipBackend)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$build = Join-Path $env:LOCALAPPDATA 'BookTTS-build'
+$build = $env:BOOKTTS_BUILD_DIR
+if (-not $build) { $build = Join-Path $env:LOCALAPPDATA 'BookTTS-build' }
 $env:CARGO_TARGET_DIR = Join-Path $build 'target'
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 

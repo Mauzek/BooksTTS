@@ -58,6 +58,19 @@ jobs:
         with:
           workspaces: desktop/src-tauri
 
+      # Что изменилось — из audiobook/web/whatsnew/<тег>.md: это же описание покажет
+      # окно обновления в установленном приложении.
+      - name: Описание релиза
+        id: notes
+        shell: bash
+        run: |
+          file="audiobook/web/whatsnew/${GITHUB_REF_NAME}.md"
+          {
+            echo 'body<<NOTES_EOF'
+            if [ -f "$file" ]; then cat "$file"; else echo 'Установщик для Windows. Уже установленное приложение обновится само.'; fi
+            echo 'NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -71,7 +84,33 @@ jobs:
           args: --config src-tauri/tauri.release.json
           tagName: ${{ github.ref_name }}
           releaseName: BookTTS ${{ github.ref_name }}
-          releaseBody: Установщик для Windows. Уже установленное приложение обновится само.
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+
+      # Страница релиза для людей: что нового, картинка, как установить и
+      # зачем каждый файл. Описание в latest.json (его показывает окно
+      # обновления в приложении) остаётся коротким — только что нового.
+      # Файл .sig не нужен: та же подпись уже лежит внутри latest.json.
+      - name: Оформление релиза
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          for asset in $(gh release view "$tag" --json assets --jq '.assets[].name' | grep '\.sig$'); do
+            gh release delete-asset "$tag" "$asset" -y
+          done
+          shots="audiobook/web/whatsnew/${version%.*}"
+          raw="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${tag}/${shots}"
+          {
+            echo "**BookTTS ${version}** — многоголосые аудиокниги из ваших книг: каждый персонаж звучит своим голосом."
+            echo
+            if [ -f "${shots}/home.webp" ]; then echo "![BookTTS ${version}](${raw}/home.webp)"; echo; fi
+            cat "audiobook/web/whatsnew/${tag}.md"
+            echo
+            sed "s/{VERSION}/${version}/g" .github/release-footer.md
+          } > release-body.md
+          gh release edit "$tag" --notes-file release-body.md

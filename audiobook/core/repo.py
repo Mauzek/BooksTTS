@@ -11,7 +11,7 @@ import re
 import sqlite3
 from typing import Any, Iterable, Sequence
 
-from .models import Book, CastEntry, Chapter, Folder, Job, JobStatus, Segment, Voice
+from .models import NARRATOR, Book, CastEntry, Chapter, Folder, Job, JobStatus, Segment, Voice
 
 __all__ = [
     "RepoError", "InvalidOperation",
@@ -25,16 +25,18 @@ __all__ = [
     "fts_query", "search",
     "get_playback", "set_playback", "recent_playback",
     "get_queue", "set_queue",
-    "list_pronunciations", "set_pronunciation", "delete_pronunciation",
+    "list_pronunciations", "all_pronunciations", "rules_for_book",
+    "set_pronunciation", "delete_pronunciation",
     "list_profiles", "get_profile", "save_profile", "delete_profile",
     "record_usage", "usage_summary", "usage_by_book", "audio_totals", "audio_by_book",
     "replace_segments", "list_segments", "get_segment", "insert_segment",
     "update_segment", "delete_segment", "renumber_segments",
-    "chapter_speakers", "book_speakers",
+    "chapter_speakers", "book_speakers", "role_slots", "set_role_slot", "rename_role_color",
+    "ROLE_SLOTS", "speaker_sample",
     "upsert_voice", "list_voices", "get_voice",
     "set_cast", "get_cast", "cast_map",
     "create_job", "update_job", "update_job_fields", "finish_job", "get_job", "list_jobs",
-    "unnotified_jobs", "clear_finished_jobs",
+    "unnotified_jobs", "clear_finished_jobs", "clean_labels", "labels", "set_chapter_listened",
 ]
 
 
@@ -255,11 +257,64 @@ def list_books(conn: Conn, folder_id: int | None = ...) -> list[Book]:
     return [Book.from_row(r) for r in rows]
 
 
+BOOK_LIST_LIMIT = 12
+BOOK_LABEL_CHARS = 40
+BOOK_TEXT_LIMITS = {"country": 60, "description": 2000, "author": 300, "title": 300}
+
+
+def clean_labels(values: Sequence[Any] | None) -> list[str]:
+    """Жанры, настроение и метки: без пустых, повторов и слишком длинных."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or ():
+        label = " ".join(str(value).split())[:BOOK_LABEL_CHARS].strip()
+        if label and label.casefold() not in seen:
+            seen.add(label.casefold())
+            out.append(label)
+    return out[:BOOK_LIST_LIMIT]
+
+
+def labels(text: str | None) -> list[str]:
+    """Список меток из JSON-строки базы; битая строка — пустой список."""
+    try:
+        value = json.loads(text or "[]")
+    except ValueError:
+        return []
+    return [str(x) for x in value] if isinstance(value, list) else []
+
+
+def _clean_year(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        year = int(value)
+    except (TypeError, ValueError):
+        raise InvalidOperation(f"год — это число, а не «{value}»") from None
+    if not -3000 <= year <= 2100:
+        raise InvalidOperation(f"год {year} выглядит ошибкой")
+    return year
+
+
 def update_book(conn: Conn, book_id: int, **fields) -> Book:
-    allowed = {"title", "author", "source_path", "cover_path", "language"}
+    allowed = {
+        "title", "author", "source_path", "cover_path", "language",
+        "year", "country", "description", "genres", "moods", "tags", "info_source",
+    }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if "title" in updates and not str(updates["title"]).strip():
         raise InvalidOperation("у книги должно быть название")
+    for name, limit in BOOK_TEXT_LIMITS.items():
+        if name in updates and updates[name] is not None:
+            updates[name] = str(updates[name]).strip()[:limit]
+    if "year" in updates:
+        updates["year"] = _clean_year(updates["year"])
+    for name in ("genres", "moods", "tags"):
+        if name in updates:
+            updates[name] = json.dumps(clean_labels(updates[name]), ensure_ascii=False)
+    if "info_source" in updates:
+        updates["info_source"] = "ai" if updates["info_source"] == "ai" else ""
+    if updates.keys() & {"year", "country", "description", "genres", "moods", "tags", "info_source"}:
+        conn.execute("UPDATE book SET info_at = datetime('now') WHERE id = ?", (book_id,))
     if updates:
         assignments = ", ".join(f"{k} = ?" for k in updates)
         conn.execute(
@@ -545,6 +600,86 @@ def book_speakers(conn: Conn, book_id: int) -> dict[str, int]:
     return {row["speaker"]: row["n"] for row in rows}
 
 
+def speaker_sample(conn: Conn, book_id: int, speaker: str, shortest: int = 12, longest: int = 180) -> str:
+    """Реплика роли для пробы голоса: первая не слишком короткая и не слишком длинная.
+
+    «Да.» ничего не скажет о голосе, а абзац на полминуты утомит — берём
+    первую подходящую по длине, а если такой нет, то просто первую.
+    """
+    rows = conn.execute(
+        "SELECT s.text FROM segment s JOIN chapter c ON c.id = s.chapter_id "
+        "WHERE c.book_id = ? AND s.speaker = ? ORDER BY c.number, s.\"order\" LIMIT 200",
+        (book_id, speaker),
+    ).fetchall()
+    texts = [row["text"].strip() for row in rows if row["text"].strip()]
+    fitting = next((t for t in texts if shortest <= len(t) <= longest), None)
+    return fitting or (texts[0][:longest] if texts else "")
+
+
+ROLE_SLOTS = 6  # цветов ролей в теме интерфейса (--c-1…--c-6); у рассказчика свой, --c-0
+
+
+def role_slots(conn: Conn, book_id: int) -> dict[str, int]:
+    """Номер цвета для каждой роли книги: 0 — рассказчик, у остальных — свой.
+
+    Цвет закрепляется за ролью, когда она появилась впервые, и дальше не
+    меняется: правка разметки не перекрашивает персонажей. Новая роль берёт
+    самый свободный цвет — у двух главных героев одного цвета не окажется.
+    Человек может выбрать цвет сам (:func:`set_role_slot`).
+    """
+    stored = {
+        row["speaker"]: row["slot"]
+        for row in conn.execute("SELECT speaker, slot FROM role_color WHERE book_id = ?", (book_id,))
+    }
+    speakers = book_speakers(conn, book_id)  # по частоте: главные получают цвет первыми
+    used = [0] * (ROLE_SLOTS + 1)
+    for name, slot in stored.items():
+        if name in speakers and 1 <= slot <= ROLE_SLOTS:
+            used[slot] += 1
+    slots: dict[str, int] = {}
+    for name in speakers:
+        if name in stored:
+            slots[name] = stored[name]
+            continue
+        if name == NARRATOR:
+            slots[name] = 0
+            continue
+        slot = min(range(1, ROLE_SLOTS + 1), key=lambda n: (used[n], n))
+        used[slot] += 1
+        slots[name] = slot
+        conn.execute(
+            "INSERT OR IGNORE INTO role_color (book_id, speaker, slot) VALUES (?, ?, ?)",
+            (book_id, name, slot),
+        )
+    return slots
+
+
+def set_role_slot(conn: Conn, book_id: int, speaker: str, slot: int) -> dict[str, int]:
+    """Выбрать роли цвет. 0 — цвет рассказчика, 1–6 — цвета персонажей."""
+    get_book(conn, book_id)
+    if not 0 <= int(slot) <= ROLE_SLOTS:
+        raise InvalidOperation(f"цвета {slot} нет: есть от 0 до {ROLE_SLOTS}")
+    conn.execute(
+        "INSERT INTO role_color (book_id, speaker, slot) VALUES (?, ?, ?) "
+        "ON CONFLICT (book_id, speaker) DO UPDATE SET slot = excluded.slot",
+        (book_id, speaker, int(slot)),
+    )
+    return role_slots(conn, book_id)
+
+
+def rename_role_color(conn: Conn, book_id: int, old: str, new: str) -> None:
+    """Роль переименовали: цвет переезжает; слили с другой — остаётся её цвет."""
+    taken = conn.execute(
+        "SELECT 1 FROM role_color WHERE book_id = ? AND speaker = ?", (book_id, new)
+    ).fetchone()
+    if taken:
+        conn.execute("DELETE FROM role_color WHERE book_id = ? AND speaker = ?", (book_id, old))
+    else:
+        conn.execute(
+            "UPDATE role_color SET speaker = ? WHERE book_id = ? AND speaker = ?", (new, book_id, old)
+        )
+
+
 # --------------------------------------------------------------------------
 # Голоса и распределение ролей
 # --------------------------------------------------------------------------
@@ -804,6 +939,11 @@ def get_playback(conn: Conn, book_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+# Главу считаем дослушанной, когда до конца остаётся меньше этого: хвост
+# обычно — тишина после последней реплики.
+LISTENED_TAIL_MS = 10_000
+
+
 def set_playback(conn: Conn, book_id: int, chapter_id: int | None, position_ms: int) -> None:
     conn.execute(
         "INSERT INTO playback (book_id, chapter_id, position_ms, updated_at) "
@@ -812,17 +952,35 @@ def set_playback(conn: Conn, book_id: int, chapter_id: int | None, position_ms: 
         "position_ms = excluded.position_ms, updated_at = excluded.updated_at",
         (book_id, chapter_id, max(0, int(position_ms))),
     )
+    if chapter_id is not None:
+        conn.execute(
+            "UPDATE chapter SET listened_at = datetime('now') "
+            "WHERE id = ? AND listened_at IS NULL AND duration_ms IS NOT NULL "
+            "AND ? >= MAX(duration_ms - ?, duration_ms * 0.9)",
+            (chapter_id, int(position_ms), LISTENED_TAIL_MS),
+        )
+
+
+def set_chapter_listened(conn: Conn, chapter_id: int, listened: bool) -> Chapter:
+    """Отметить главу прослушанной или снять отметку руками."""
+    get_chapter(conn, chapter_id)
+    conn.execute(
+        "UPDATE chapter SET listened_at = CASE WHEN ? THEN COALESCE(listened_at, datetime('now')) END "
+        "WHERE id = ?",
+        (int(bool(listened)), chapter_id),
+    )
+    return get_chapter(conn, chapter_id)
 
 
 def recent_playback(conn: Conn, limit: int = 6) -> list[dict[str, Any]]:
     """Книги, которые слушали последними, с долей прослушанного.
 
-    Доля считается по длительности: главы до текущей плюс позиция в ней,
+    Доля считается по длительности: дослушанные главы плюс позиция в текущей,
     делённые на всё озвученное в книге.
     """
     rows = conn.execute(
         "SELECT p.book_id, p.chapter_id, p.position_ms, p.updated_at, "
-        "b.title, b.author, b.cover_path, c.number, c.title AS chapter_title, "
+        "b.title, b.author, b.cover_path, b.genres, b.moods, c.number, c.title AS chapter_title, "
         "c.duration_ms AS chapter_ms "
         "FROM playback p JOIN book b ON b.id = p.book_id "
         "LEFT JOIN chapter c ON c.id = p.chapter_id "
@@ -831,11 +989,14 @@ def recent_playback(conn: Conn, limit: int = 6) -> list[dict[str, Any]]:
     ).fetchall()
     out = []
     for row in rows:
+        # Прослушанное — отмеченные главы плюс позиция в текущей: повторное
+        # прослушивание начала книги не обнуляет то, что уже дослушано.
         totals = conn.execute(
             "SELECT COALESCE(SUM(duration_ms), 0) AS total, "
-            "COALESCE(SUM(CASE WHEN number < ? THEN duration_ms ELSE 0 END), 0) AS before "
+            "COALESCE(SUM(CASE WHEN listened_at IS NOT NULL AND id IS NOT ? "
+            "THEN duration_ms ELSE 0 END), 0) AS before "
             "FROM chapter WHERE book_id = ? AND audio_path IS NOT NULL",
-            (row["number"] or 0, row["book_id"]),
+            (row["chapter_id"], row["book_id"]),
         ).fetchone()
         total = totals["total"] or 0
         listened = (totals["before"] or 0) + (row["position_ms"] or 0)
@@ -843,6 +1004,7 @@ def recent_playback(conn: Conn, limit: int = 6) -> list[dict[str, Any]]:
         out.append({
             "book_id": row["book_id"], "chapter_id": row["chapter_id"],
             "title": row["title"], "author": row["author"], "cover_path": row["cover_path"],
+            "genres": labels(row["genres"]), "moods": labels(row["moods"]),
             "chapter_label": label if row["number"] is not None else "",
             "position_ms": row["position_ms"] or 0, "chapter_ms": row["chapter_ms"] or 0,
             "total_ms": total, "listened_ms": min(listened, total),
@@ -871,36 +1033,70 @@ def set_queue(conn: Conn, chapter_ids: Sequence[int]) -> list[int]:
 # --------------------------------------------------------------------------
 
 
-def list_pronunciations(conn: Conn, book_id: int) -> list[dict[str, Any]]:
+def _rule_dict(row) -> dict[str, Any]:
+    return {**dict(row), "whole_word": bool(row["whole_word"]),
+            "case_sensitive": bool(row["case_sensitive"])}
+
+
+def list_pronunciations(conn: Conn, book_id: int | None) -> list[dict[str, Any]]:
+    """Правила одной книги; ``None`` — общие, для всех книг."""
     rows = conn.execute(
-        "SELECT * FROM pronunciation WHERE book_id = ? ORDER BY term COLLATE NOCASE", (book_id,)
+        "SELECT * FROM pronunciation WHERE book_id IS ? ORDER BY term COLLATE NOCASE", (book_id,)
     ).fetchall()
-    return [
-        {**dict(row), "whole_word": bool(row["whole_word"]),
-         "case_sensitive": bool(row["case_sensitive"])}
-        for row in rows
-    ]
+    return [_rule_dict(row) for row in rows]
+
+
+def all_pronunciations(conn: Conn) -> list[dict[str, Any]]:
+    """Весь словарь: общие правила и правила книг — с названием книги."""
+    rows = conn.execute(
+        "SELECT p.*, b.title AS book_title FROM pronunciation p "
+        "LEFT JOIN book b ON b.id = p.book_id "
+        "ORDER BY p.book_id IS NOT NULL, b.title COLLATE NOCASE, p.term COLLATE NOCASE"
+    ).fetchall()
+    return [_rule_dict(row) for row in rows]
+
+
+def rules_for_book(conn: Conn, book_id: int) -> list[dict[str, Any]]:
+    """Что применять при озвучке книги: общие правила плюс её собственные.
+
+    Правило книги сильнее общего с тем же словом: общее «Лев → Лев» не должно
+    перебить книжное «Лев → Лёв».
+    """
+    own = list_pronunciations(conn, book_id)
+    terms = {rule["term"].casefold() for rule in own}
+    shared = [rule for rule in list_pronunciations(conn, None) if rule["term"].casefold() not in terms]
+    return shared + own
 
 
 def set_pronunciation(
     conn: Conn,
-    book_id: int,
+    book_id: int | None,
     term: str,
     replacement: str,
     whole_word: bool = True,
     case_sensitive: bool = False,
 ) -> None:
+    """Добавить или поменять правило. ``book_id=None`` — для всех книг."""
     term = (term or "").strip()
     if not term:
         raise InvalidOperation("пустое слово в словаре произношений")
-    get_book(conn, book_id)
-    conn.execute(
-        "INSERT INTO pronunciation (book_id, term, replacement, whole_word, case_sensitive) "
-        "VALUES (?, ?, ?, ?, ?) ON CONFLICT (book_id, term) DO UPDATE SET "
-        "replacement = excluded.replacement, whole_word = excluded.whole_word, "
-        "case_sensitive = excluded.case_sensitive",
-        (book_id, term, replacement.strip(), int(whole_word), int(case_sensitive)),
-    )
+    if book_id is not None:
+        get_book(conn, book_id)
+    values = (replacement.strip(), int(whole_word), int(case_sensitive))
+    existing = conn.execute(
+        "SELECT id FROM pronunciation WHERE book_id IS ? AND term = ?", (book_id, term)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE pronunciation SET replacement = ?, whole_word = ?, case_sensitive = ? WHERE id = ?",
+            (*values, existing["id"]),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO pronunciation (book_id, term, replacement, whole_word, case_sensitive) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (book_id, term, *values),
+        )
 
 
 def delete_pronunciation(conn: Conn, pronunciation_id: int) -> None:

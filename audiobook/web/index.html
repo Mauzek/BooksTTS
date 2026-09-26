@@ -11,39 +11,40 @@ try {
   if (saved === 'light' || saved === 'dark') document.documentElement.setAttribute('data-theme', saved);
 } catch (e) { /* приватный режим */ }
 </script>
+<link rel="preload" href="/ui/fonts/onest-cyrillic.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/ui/css/tokens.css">
 <link rel="stylesheet" href="/ui/css/app.css">
 <link rel="stylesheet" href="/ui/css/screens.css">
+<link rel="stylesheet" href="/ui/css/pages.css">
+<link rel="stylesheet" href="/ui/css/studio.css">
 </head>
 <body>
 
 <div class="app">
-  <aside class="sidebar">
-    <div class="brand">BookTTS</div>
-    <nav class="nav" id="nav">
-      <a href="#/" data-route="library"><svg class="icon"><use href="/ui/icons.svg#library"></use></svg> Библиотека</a>
-      <a href="#/jobs" data-route="jobs"><svg class="icon"><use href="/ui/icons.svg#list-checks"></use></svg> Задачи<span class="badge" id="jobs-badge" hidden></span></a>
-      <a href="#/voices" data-route="voices"><svg class="icon"><use href="/ui/icons.svg#mic"></use></svg> Голоса</a>
-      <a href="#/stats" data-route="stats"><svg class="icon"><use href="/ui/icons.svg#chart-column"></use></svg> Статистика</a>
-      <a href="#/settings" data-route="settings"><svg class="icon"><use href="/ui/icons.svg#settings"></use></svg> Настройки</a>
+  <header class="topbar">
+    <div class="topbar-side">
+      <a class="logo" href="#/" title="Главная">booktts<span>.</span></a>
+      <div class="history">
+        <button id="nav-back" class="round" aria-label="Назад" title="Назад (Alt+←)"><svg class="icon" aria-hidden="true"><use href="/ui/icons.svg#arrow-left"></use></svg></button>
+        <button id="nav-forward" class="round" aria-label="Вперёд" title="Вперёд (Alt+→)"><svg class="icon" aria-hidden="true"><use href="/ui/icons.svg#arrow-right"></use></svg></button>
+      </div>
+    </div>
+    <nav class="tabs" id="nav" aria-label="Разделы">
+      <div class="tabs-track">
+        <span class="tabs-pill" aria-hidden="true"></span>
+        <a href="#/" data-route="listen"><span class="fixed-bold" data-text="Главная">Главная</span></a>
+        <a href="#/library" data-route="library"><span class="fixed-bold" data-text="Библиотека">Библиотека</span></a>
+        <a href="#/studio" data-route="studio"><span class="fixed-bold" data-text="Студия">Студия</span><span class="badge" id="jobs-badge" hidden></span></a>
+      </div>
     </nav>
-    <div class="search">
-      <input id="search" type="search" placeholder="Поиск: названия и текст глав" autocomplete="off">
+    <div class="topbar-side end">
+      <button id="update" class="update-pill" hidden></button>
+      <button id="import" class="primary" title="Добавить книгу (Ctrl+O) — или перетащите файл в окно"><svg class="icon" aria-hidden="true"><use href="/ui/icons.svg#plus"></use></svg>Книга</button>
+      <a id="search-link" class="button round" href="#/search" aria-label="Поиск" title="Поиск (Ctrl+K)"><svg class="icon" aria-hidden="true"><use href="/ui/icons.svg#search"></use></svg></a>
+      <button id="theme" class="round"></button>
+      <a id="settings-link" class="button round" href="#/settings" aria-label="Настройки" title="Настройки"><svg class="icon" aria-hidden="true"><use href="/ui/icons.svg#settings"></use></svg></a>
     </div>
-    <div class="tree-head">
-      <span class="grow">Папки и книги</span>
-      <button id="new-folder" title="Новая папка">
-        <svg class="icon"><use href="/ui/icons.svg#folder-plus"></use></svg>папка
-      </button>
-      <button id="import" title="Добавить книги">
-        <svg class="icon"><use href="/ui/icons.svg#book-plus"></use></svg>книга
-      </button>
-    </div>
-    <div id="tree" class="tree"></div>
-    <div id="update" class="update-banner" hidden></div>
-    <div class="sidebar-foot">
-      <button id="theme" class="ghost" title="Тема оформления"></button>
-    </div>
-  </aside>
+  </header>
   <main id="view" class="view"></main>
 </div>
 

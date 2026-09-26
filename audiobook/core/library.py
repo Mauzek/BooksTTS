@@ -16,7 +16,7 @@ from .. import paths
 from . import repo, secrets
 from .markup import DEFAULT_BATCH_CHARS, DEFAULT_MODEL, MarkupResult, markup_text
 from .models import Book, Chapter, Segment
-from .parser import PARAGRAPH_SEP, chapter_text, load_book, paragraph_spans
+from .parser import PARAGRAPH_SEP, chapter_from_text, chapter_text, load_book, paragraph_spans
 
 __all__ = [
     "LibraryError",
@@ -26,6 +26,11 @@ __all__ = [
     "book_view",
     "split_chapter",
     "merge_with_next",
+    "add_chapters_from_file",
+    "add_chapter_from_text",
+    "remove_chapter",
+    "set_cover",
+    "remove_cover",
     "search_library",
     "markup_chapter",
     "chapter_view",
@@ -159,6 +164,7 @@ def library_tree(conn: Conn) -> dict[str, Any]:
 def book_view(conn: Conn, book_id: int) -> dict[str, Any]:
     book = repo.get_book(conn, book_id)
     stats = repo.chapter_stats(conn, book_id)
+    slots = repo.role_slots(conn, book_id)
     return {
         "book": book.to_dict(),
         "chapters": [
@@ -166,7 +172,7 @@ def book_view(conn: Conn, book_id: int) -> dict[str, Any]:
             for chapter in repo.list_chapters(conn, book_id)
         ],
         "speakers": [
-            {"name": name, "count": count}
+            {"name": name, "count": count, "slot": slots[name]}
             for name, count in repo.book_speakers(conn, book_id).items()
         ],
         "playback": repo.get_playback(conn, book_id),
@@ -236,6 +242,135 @@ def merge_with_next(conn: Conn, chapter_id: int) -> Chapter:
 
 
 # --------------------------------------------------------------------------
+# Главы: добавить в готовую книгу, удалить
+# --------------------------------------------------------------------------
+
+
+def _insert_chapters(
+    conn: Conn, book_id: int, chapters: Sequence[tuple[str, str]], after: int | None
+) -> list[Chapter]:
+    """Вставить главы после главы номер ``after`` (None — в конец книги)."""
+    existing = repo.list_chapters(conn, book_id)
+    last = existing[-1].number if existing else 0
+    anchor = last if after is None else max(0, min(int(after), last))
+    if anchor < last:
+        repo.shift_chapter_numbers(conn, book_id, anchor, len(chapters))
+    return [
+        repo.create_chapter(conn, book_id=book_id, number=anchor + i, title=title, text=text)
+        for i, (title, text) in enumerate(chapters, start=1)
+    ]
+
+
+def add_chapters_from_file(
+    conn: Conn, book_id: int, source: str | Path, after: int | None = None,
+    min_chapter_chars: int = 300,
+) -> list[Chapter]:
+    """Дописать в книгу главы из файла любого поддерживаемого формата.
+
+    Файл без заголовков глав станет одной главой с именем файла.
+    """
+    repo.get_book(conn, book_id)
+    source = Path(source)
+    parsed = load_book(source, min_chapter_chars=min_chapter_chars)
+    chapters = [
+        (chapter.title, chapter_text(chapter.paragraphs))
+        for chapter in parsed.chapters
+    ]
+    chapters = [(title, text) for title, text in chapters if text.strip()]
+    if not chapters:
+        raise LibraryError(f"в файле {source.name} не нашлось текста")
+    if len(chapters) == 1 and not chapters[0][0]:
+        stem = source.name.split(".")[0]
+        chapters = [(stem, chapters[0][1])]
+    return _insert_chapters(conn, book_id, chapters, after)
+
+
+def add_chapter_from_text(
+    conn: Conn, book_id: int, text: str, title: str = "", after: int | None = None
+) -> Chapter:
+    """Дописать главу из вставленного текста. «Глава 5. …» в первой строке станет названием."""
+    repo.get_book(conn, book_id)
+    parsed = chapter_from_text(text, title=title.strip())
+    body = chapter_text(parsed.paragraphs)
+    if not body.strip():
+        raise LibraryError("вставьте текст главы — пока он пустой")
+    return _insert_chapters(conn, book_id, [(parsed.title.strip(), body)], after)[0]
+
+
+def remove_chapter(conn: Conn, chapter_id: int) -> None:
+    """Удалить главу с разметкой и озвучкой; следующие главы сдвинутся вверх."""
+    chapter = repo.get_chapter(conn, chapter_id)
+    if len(repo.list_chapters(conn, chapter.book_id)) <= 1:
+        raise LibraryError("это единственная глава — удалите книгу целиком")
+    audio = [chapter.audio_path] + [s.audio_path for s in repo.list_segments(conn, chapter_id)]
+    repo.delete_chapter(conn, chapter_id)
+    repo.shift_chapter_numbers(conn, chapter.book_id, chapter.number, -1)
+    for relative in audio:
+        if relative:
+            try:
+                paths.absolute(relative).unlink(missing_ok=True)
+            except (paths.PathsError, OSError):
+                pass
+
+
+# --------------------------------------------------------------------------
+# Обложка
+# --------------------------------------------------------------------------
+
+MAX_COVER_BYTES = 15 * 1024 * 1024
+
+
+def _image_type(data: bytes) -> str | None:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    return None
+
+
+def _drop_cover_file(book: Book) -> None:
+    if book.cover_path:
+        try:
+            paths.absolute(book.cover_path).unlink(missing_ok=True)
+        except (paths.PathsError, OSError):
+            pass
+
+
+def set_cover(conn: Conn, book_id: int, data: bytes) -> Book:
+    """Поставить свою картинку обложкой. Прежняя обложка удаляется."""
+    book = repo.get_book(conn, book_id)
+    if not data:
+        raise LibraryError("пустой файл")
+    if len(data) > MAX_COVER_BYTES:
+        raise LibraryError("картинка больше 15 МБ — уменьшите её")
+    kind = _image_type(data)
+    if kind is None:
+        raise LibraryError("обложкой может быть картинка JPG, PNG, WebP или GIF")
+    paths.ensure_layout()
+    target = _unique_name(paths.books_dir(), f"book-{book_id}.cover.{kind}")
+    target.write_bytes(data)
+    try:
+        updated = repo.update_book(conn, book_id, cover_path=paths.relative(target))
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    _drop_cover_file(book)
+    return updated
+
+
+def remove_cover(conn: Conn, book_id: int) -> Book:
+    """Убрать картинку — обложка снова рисуется по жанру и настроению."""
+    book = repo.get_book(conn, book_id)
+    updated = repo.update_book(conn, book_id, cover_path=None)
+    _drop_cover_file(book)
+    return updated
+
+
+# --------------------------------------------------------------------------
 # Поиск
 # --------------------------------------------------------------------------
 
@@ -299,13 +434,16 @@ def search_library(conn: Conn, text: str, limit: int = 40) -> list[dict[str, Any
                 results.append({
                     "kind": kind, "id": book.id, "folder_id": book.folder_id,
                     "title": _mark(book.title, pattern), "author": _mark(book.author, pattern),
+                    "cover_path": book.cover_path, "genres": book.genres, "moods": book.moods,
                 })
             else:
                 chapter = repo.get_chapter(conn, ref_id)
                 book = repo.get_book(conn, chapter.book_id)
                 results.append({
                     "kind": "chapter", "id": chapter.id, "book_id": book.id,
-                    "book_title": book.title, "title": _mark(chapter.label, pattern),
+                    "book_title": book.title, "cover_path": book.cover_path,
+                    "genres": book.genres, "moods": book.moods,
+                    "title": _mark(chapter.label, pattern),
                     "snippet": _snippet(chapter.text, pattern),
                 })
         except repo.RepoError:  # индекс обновляется триггерами, но на всякий случай
@@ -417,14 +555,16 @@ def chapter_view(conn: Conn, chapter_id: int) -> dict[str, Any]:
     segments = repo.list_segments(conn, chapter_id)
     speakers = repo.chapter_speakers(conn, chapter_id)
     cast = repo.cast_map(conn, chapter.book_id)
+    slots = repo.role_slots(conn, chapter.book_id)
     return {
         "chapter": chapter.to_dict(),
         "book": repo.get_book(conn, chapter.book_id).to_dict(),
-        "segments": [s.to_dict() for s in segments],
+        "segments": [{**s.to_dict(), "slot": slots.get(s.speaker, 0)} for s in segments],
         "speakers": [
             {
                 "name": name,
                 "count": count,
+                "slot": slots.get(name, 0),
                 "voice": cast[name].to_dict() if name in cast else None,
             }
             for name, count in speakers.items()

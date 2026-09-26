@@ -40,7 +40,12 @@ export async function api(path, { method = 'GET', body, headers = {} } = {}) {
       init.headers['content-type'] = 'application/json';
     }
   }
-  const response = await fetch(path, init);
+  let response;
+  try {
+    response = await fetch(path, init);
+  } catch {
+    throw new ApiError('нет связи с приложением — оно перезапускается, повторите через пару секунд', 0);
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new ApiError(detailText(data.detail) || response.statusText, response.status);
   return data;
@@ -71,12 +76,12 @@ export async function waitForJob(jobId, onUpdate = () => {}, { interval = 1000, 
  * Выбрать файлы книг. В десктопе — системный диалог (возвращает пути),
  * в браузере — обычный <input type=file> (возвращает File).
  */
-export async function pickBookFiles(extensions) {
+export async function pickBookFiles(extensions, { title = 'Добавить книги' } = {}) {
   const plain = [...new Set(extensions.map((e) => e.split('.').pop()))];
   if (tauri?.dialog?.open) {
     const picked = await tauri.dialog.open({
       multiple: true,
-      title: 'Добавить книги',
+      title,
       filters: [{ name: 'Книги', extensions: plain }],
     });
     if (!picked) return [];
@@ -100,9 +105,29 @@ export async function importBook(item, folderId = null) {
   return api(`/api/books/upload?${params}`, { method: 'PUT', body: item.file });
 }
 
-/** Системное уведомление: Tauri, иначе Web Notifications, иначе молча. */
-export async function notify(title, body = '') {
+/** Дописать в книгу главы из выбранного файла: путь (десктоп) или содержимое (браузер). */
+export async function importChapters(bookId, item, after = null) {
+  if (item.path) return post(`/api/books/${bookId}/chapters/import`, { path: item.path, after });
+  const params = new URLSearchParams({ filename: item.file.name });
+  if (after !== null && after !== undefined) params.set('after', after);
+  return api(`/api/books/${bookId}/chapters/upload?${params}`, { method: 'PUT', body: item.file });
+}
+
+/**
+ * Системное уведомление Windows. В десктопе его показывает оболочка от имени
+ * BookTTS, и нажатие открывает экран route. Оболочка постарше этой команды не
+ * знает — тогда плагин Tauri, в браузере — Web Notifications.
+ */
+export async function notify(title, body = '', route = null) {
   try {
+    if (tauri?.core?.invoke) {
+      try {
+        await tauri.core.invoke('notify', { title, body, route });
+        return;
+      } catch {
+        // старая оболочка — ниже плагин
+      }
+    }
     const plugin = tauri?.notification;
     if (plugin) {
       let granted = await plugin.isPermissionGranted();

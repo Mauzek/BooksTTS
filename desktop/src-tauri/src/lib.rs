@@ -4,6 +4,7 @@
 //! и гасит бэкенд при выходе. Вся логика — в `audiobook/core`.
 
 mod backend;
+mod notify;
 mod updates;
 
 use tauri::{Manager, RunEvent};
@@ -29,6 +30,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             backend::backend_status,
             backend::restart_backend,
+            notify::notify,
             updates::app_version,
             updates::check_update,
             updates::install_update
